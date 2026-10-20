@@ -21,12 +21,27 @@ type ManagedSocket = {
 
 const APP_PORT = Number(process.env.COMPANION_PORT ?? 4850);
 const WEB_PORT = Number(process.env.APP_WEB_PORT ?? 3000);
+const APP_WEB_URL = process.env.APP_WEB_URL;
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
+
+// Enable CORS for Vercel and remote dashboards
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200);
+    return;
+  }
+  next();
+});
+
 app.use(
   helmet({
     contentSecurityPolicy: false,
+    crossOriginResourcePolicy: false,
   }),
 );
 
@@ -43,8 +58,13 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 function makePairingUrl(token: string): string {
-  return `http://${selected.address}:${WEB_PORT}/remote?token=${encodeURIComponent(token)}&wsPort=${APP_PORT}`;
+  if (APP_WEB_URL) {
+    const base = APP_WEB_URL.replace(/\/$/, "");
+    return `${base}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
+  }
+  return `http://${selected.address}:${WEB_PORT}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
 }
+
 
 function statusPayload(message?: string) {
   const token = manager.currentToken();

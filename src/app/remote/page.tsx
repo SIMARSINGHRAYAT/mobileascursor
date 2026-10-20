@@ -7,12 +7,26 @@ import { defaultSettings, settingsSchema, type ControlMessage, type ControllerSe
 type SocketState = "connecting" | "awaiting_approval" | "connected" | "disconnected" | "error";
 
 const storageKey = "mobile-as-cursor:settings";
+const hostStorageKey = "mobile-as-cursor:ws-host";
 
 export default function RemotePage() {
   const [socketState, setSocketState] = useState<SocketState>("connecting");
   const [statusText, setStatusText] = useState("Connecting...");
-  const [settings, setSettings] = useState<ControllerSettings>(defaultSettings);
+  const [settings, setSettings] = useState<ControllerSettings>(() => {
+    if (typeof window !== "undefined") {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        try {
+          return settingsSchema.parse(JSON.parse(raw));
+        } catch {
+          localStorage.removeItem(storageKey);
+        }
+      }
+    }
+    return defaultSettings;
+  });
   const [showSettings, setShowSettings] = useState(false);
+  const [showHostConfig, setShowHostConfig] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const padRef = useRef<HTMLDivElement | null>(null);
@@ -22,16 +36,43 @@ export default function RemotePage() {
   const lastTapRef = useRef<number>(0);
   const draggingRef = useRef(false);
 
-  const [token, setToken] = useState("");
-  const [wsPort, setWsPort] = useState(4850);
-  const [device, setDevice] = useState("");
+  const [token, setToken] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      return params.get("token") ?? "";
+    }
+    return "";
+  });
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    setToken(params.get("token") ?? "");
-    setWsPort(Number(params.get("wsPort") ?? "4850"));
-    setDevice(params.get("device") ?? `Phone-${Math.floor(Math.random() * 900 + 100)}`);
-  }, []);
+  const [wsPort, setWsPort] = useState<number>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      return Number(params.get("wsPort") ?? "4850");
+    }
+    return 4850;
+  });
+
+  const [wsHost, setWsHost] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const paramHost = params.get("wsHost") || params.get("host");
+      if (paramHost) return paramHost;
+      const saved = localStorage.getItem(hostStorageKey);
+      if (saved) return saved;
+      return window.location.hostname;
+    }
+    return "";
+  });
+
+  const [device] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      return params.get("device") || `Phone-${Math.floor(Math.random() * 900 + 100)}`;
+    }
+    return "Phone";
+  });
+
+  const [hostInput, setHostInput] = useState<string>(wsHost);
 
   const send = useCallback((msg: ControlMessage | { type: "pair_request"; token: string; deviceLabel: string; settings: ControllerSettings }) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -60,24 +101,35 @@ export default function RemotePage() {
   );
 
   useEffect(() => {
-    const raw = localStorage.getItem(storageKey);
-    if (raw) {
-      try {
-        setSettings(settingsSchema.parse(JSON.parse(raw)));
-      } catch {
-        localStorage.removeItem(storageKey);
-      }
+    if (typeof window !== "undefined") {
+      localStorage.setItem(storageKey, JSON.stringify(settings));
     }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify(settings));
   }, [settings]);
 
+  // Connect to companion WebSocket server
   useEffect(() => {
-    if (!token || !device) return;
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.hostname}:${wsPort}/ws`);
+    if (!token || !device || !wsHost) return;
+
+    let wsUrl: string;
+    if (wsHost.startsWith("ws://") || wsHost.startsWith("wss://")) {
+      wsUrl = wsHost.endsWith("/ws") ? wsHost : `${wsHost}/ws`;
+    } else {
+      const protocol = window.location.protocol === "https:" && !wsHost.match(/^\d+\.\d+\.\d+\.\d+$/) ? "wss" : "ws";
+      wsUrl = `${protocol}://${wsHost}:${wsPort}/ws`;
+    }
+
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch {
+      queueMicrotask(() => {
+        setSocketState("error");
+        setStatusText("Failed to create WebSocket");
+      });
+      return;
+    }
+
+
     wsRef.current = socket;
 
     socket.onopen = () => {
@@ -117,7 +169,7 @@ export default function RemotePage() {
 
     socket.onerror = () => {
       setSocketState("error");
-      setStatusText("Connection error");
+      setStatusText(`Cannot reach ${wsHost}:${wsPort}`);
     };
 
     socket.onclose = () => {
@@ -131,7 +183,7 @@ export default function RemotePage() {
       socket.close();
       wsRef.current = null;
     };
-  }, [device, send, settings, token, wsPort]);
+  }, [device, send, settings, token, wsHost, wsPort]);
 
   const moveTransform = (dx: number, dy: number) => {
     const speed = settings.sensitivity;
@@ -198,17 +250,63 @@ export default function RemotePage() {
     if (settings.haptic && navigator.vibrate) navigator.vibrate(10);
   };
 
+  const reconnectWithHost = (newHost: string) => {
+    const trimmed = newHost.trim();
+    setWsHost(trimmed);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(hostStorageKey, trimmed);
+    }
+    setShowHostConfig(false);
+  };
+
   return (
     <main className="futuristic-bg flex min-h-screen flex-col px-3 pb-4 pt-3 text-white">
       <header className="glass-card gradient-border flex items-center justify-between rounded-2xl px-4 py-3">
         <div>
           <h1 className="text-base font-semibold">Mobile as Cursor</h1>
-          <p className="text-xs text-slate-300">{statusText}</p>
+          <p className="text-xs text-slate-300">
+            {statusText} {wsHost ? `(${wsHost})` : ""}
+          </p>
         </div>
-        <button className="rounded-lg bg-white/10 px-3 py-2 text-xs" onClick={() => setShowSettings((v) => !v)}>
-          Settings
-        </button>
+        <div className="flex gap-2">
+          <button
+            className="rounded-lg bg-white/10 px-2.5 py-1.5 text-xs text-cyan-200"
+            onClick={() => {
+              setHostInput(wsHost);
+              setShowHostConfig((v) => !v);
+            }}
+          >
+            Host
+          </button>
+          <button className="rounded-lg bg-white/10 px-2.5 py-1.5 text-xs" onClick={() => setShowSettings((v) => !v)}>
+            Settings
+          </button>
+        </div>
       </header>
+
+      {showHostConfig ? (
+        <section className="glass-card mt-3 space-y-2 rounded-2xl p-3 text-sm">
+          <p className="font-semibold text-xs text-slate-200">Desktop Companion IP Address</p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={hostInput}
+              onChange={(e) => setHostInput(e.target.value)}
+              placeholder="e.g. 192.168.1.5"
+              className="flex-1 rounded-xl bg-black/40 px-3 py-1.5 text-xs text-white border border-white/15 outline-none focus:border-cyan-400"
+            />
+            <button
+              onClick={() => reconnectWithHost(hostInput)}
+              className="rounded-xl bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-slate-950"
+            >
+              Connect
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-400">
+            Enter your PC&apos;s local Wi-Fi IP address shown on the desktop dashboard.
+          </p>
+        </section>
+      ) : null}
 
       {showSettings ? (
         <section className="glass-card mt-3 space-y-2 rounded-2xl p-3 text-sm">
@@ -227,13 +325,15 @@ export default function RemotePage() {
       <section
         ref={padRef}
         className="glass-card gradient-border mt-3 flex-[1_1_auto] rounded-3xl"
-        style={{ minHeight: "65vh", touchAction: "none", userSelect: "none" }}
+        style={{ minHeight: "60vh", touchAction: "none", userSelect: "none" }}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
         onPointerCancel={pointerUp}
       >
-        <div className="flex h-full items-center justify-center text-sm text-slate-300">Trackpad</div>
+        <div className="flex h-full items-center justify-center text-sm text-slate-300">
+          {socketState === "connected" ? "Trackpad Active" : "Trackpad (Disconnected)"}
+        </div>
       </section>
 
       <div className="mt-3 grid grid-cols-2 gap-3">
@@ -263,7 +363,13 @@ export default function RemotePage() {
       </div>
 
       {socketState !== "connected" ? (
-        <p className="mt-3 text-center text-xs text-amber-200">Connection must be approved from desktop dashboard.</p>
+        <div className="mt-3 text-center text-xs text-amber-200">
+          {!token ? (
+            <span>Scan QR code from desktop dashboard to obtain pairing token.</span>
+          ) : (
+            <span>Connection must be approved on your desktop PC dashboard.</span>
+          )}
+        </div>
       ) : null}
 
       <div className="mt-2 text-center text-[11px] text-slate-400">

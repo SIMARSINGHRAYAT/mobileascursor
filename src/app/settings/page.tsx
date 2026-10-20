@@ -33,19 +33,21 @@ function Toggle({
 }
 
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<ControllerSettings>(defaultSettings);
+  const [settings, setSettings] = useState<ControllerSettings>(() => {
+    if (typeof window !== "undefined") {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        try {
+          return settingsSchema.parse(JSON.parse(raw));
+        } catch {
+          localStorage.removeItem(storageKey);
+        }
+      }
+    }
+    return defaultSettings;
+  });
   const [savedAt, setSavedAt] = useState<string>("");
 
-  useEffect(() => {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return;
-    try {
-      const parsed = settingsSchema.parse(JSON.parse(raw));
-      setSettings(parsed);
-    } catch {
-      localStorage.removeItem(storageKey);
-    }
-  }, []);
 
   const persist = async (nextSettings: ControllerSettings) => {
     setSettings(nextSettings);

@@ -1,5 +1,5 @@
 {
-  "name": "nextjs-postgresql-template",
+  "name": "mobile-as-cursor",
   "private": true,
   "scripts": {
     "dev": "next dev",
