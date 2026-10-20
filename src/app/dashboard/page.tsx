@@ -22,8 +22,21 @@ type CompanionStatus = {
   message?: string;
 };
 
+type NetworkInterface = {
+  name: string;
+  address: string;
+};
+
 const defaultCompanionUrl = process.env.NEXT_PUBLIC_COMPANION_URL ?? "http://127.0.0.1:4850";
 const companionStorageKey = "mobile-as-cursor:companion-url";
+const customHostStorageKey = "mobile-as-cursor:custom-host";
+
+function generateToken(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID().replace(/-/g, "");
+  }
+  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+}
 
 export default function DashboardPage() {
   const [companionUrl, setCompanionUrl] = useState<string>(() => {
@@ -34,14 +47,26 @@ export default function DashboardPage() {
   });
 
   const [status, setStatus] = useState<CompanionStatus | null>(null);
+  const [localToken, setLocalToken] = useState<string>(() => generateToken());
+  const [localExpiresAt, setLocalExpiresAt] = useState<number>(() => Date.now() + 15 * 60_000);
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
   const [busy, setBusy] = useState<string>("");
-  const [now, setNow] = useState<number | null>(null);
+  const [now, setNow] = useState<number>(() => Date.now());
   const [showConfig, setShowConfig] = useState(false);
   const [customUrlInput, setCustomUrlInput] = useState(companionUrl);
   const [useCloudUrl, setUseCloudUrl] = useState(true);
+  const [copied, setCopied] = useState(false);
 
-  // Update a ticking timestamp for duration without impure calls during render
+  // Network interfaces from companion
+  const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
+  const [selectedHost, setSelectedHost] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem(customHostStorageKey) ?? "";
+    }
+    return "";
+  });
+
+  // Ticking timer for live expiration and connection duration
   useEffect(() => {
     const timer = setInterval(() => {
       setNow(Date.now());
@@ -49,40 +74,7 @@ export default function DashboardPage() {
     return () => clearInterval(timer);
   }, []);
 
-  const connectionDuration = useMemo(() => {
-    if (!status?.connectedDevice || !now) return "—";
-    const seconds = Math.max(0, Math.floor((now - status.connectedDevice.connectedAt) / 1000));
-    const min = Math.floor(seconds / 60);
-    const sec = seconds % 60;
-    return `${min}m ${String(sec).padStart(2, "0")}s`;
-  }, [status?.connectedDevice, now]);
-
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch(`${companionUrl}/api/status`, { cache: "no-store" });
-      const data = (await res.json()) as CompanionStatus;
-      setStatus(data);
-    } catch {
-      setStatus({
-        status: "Connection Failed",
-        hostIp: "Unavailable",
-        webPort: 3000,
-        wsPort: 4850,
-        pairingUrl: null,
-        tokenExpiresAt: null,
-        pendingRequest: null,
-        connectedDevice: null,
-        latencyMs: null,
-        networkName: "Disconnected",
-        controlsEnabled: false,
-        settings: defaultSettings,
-        message:
-          "Desktop companion is not running or unreachable. Make sure companion is started on Windows.",
-      });
-    }
-  }, [companionUrl]);
-
-  // Polling companion with asynchronous invocation to prevent React 19 set-state-in-effect warning
+  // Poll companion status
   useEffect(() => {
     let isSubscribed = true;
 
@@ -90,7 +82,22 @@ export default function DashboardPage() {
       try {
         const res = await fetch(`${companionUrl}/api/status`, { cache: "no-store" });
         const data = (await res.json()) as CompanionStatus;
-        if (isSubscribed) setStatus(data);
+        if (isSubscribed) {
+          setStatus(data);
+          // If companion provides a valid token, sync it
+          if (data.pairingUrl) {
+            try {
+              const parsed = new URL(data.pairingUrl);
+              const t = parsed.searchParams.get("token");
+              if (t) setLocalToken(t);
+            } catch {
+              // ignore url parse error
+            }
+          }
+          if (data.tokenExpiresAt) {
+            setLocalExpiresAt(data.tokenExpiresAt);
+          }
+        }
       } catch {
         if (isSubscribed) {
           setStatus({
@@ -107,7 +114,7 @@ export default function DashboardPage() {
             controlsEnabled: false,
             settings: defaultSettings,
             message:
-              "Desktop companion is not running or unreachable. Make sure companion is started on Windows.",
+              "Desktop companion is not running. Start it with: npm run companion:dev (or companion:start).",
           });
         }
       }
@@ -128,46 +135,97 @@ export default function DashboardPage() {
     };
   }, [companionUrl]);
 
-  // Calculate actual pairing URL: either cloud-hosted (Vercel) or direct LAN
-  const effectivePairingUrl = useMemo(() => {
-    if (!status?.pairingUrl) return null;
-    if (typeof window === "undefined") return status.pairingUrl;
-
-    if (useCloudUrl && window.location.origin) {
+  // Fetch available network adapters from companion
+  useEffect(() => {
+    let isSubscribed = true;
+    const fetchInterfaces = async () => {
       try {
-        const parsed = new URL(status.pairingUrl);
-        const token = parsed.searchParams.get("token") ?? "";
-        const wsPort = parsed.searchParams.get("wsPort") ?? String(status.wsPort);
-        const host = status.hostIp !== "Unavailable" ? status.hostIp : parsed.hostname;
-        return `${window.location.origin}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(host)}&wsPort=${encodeURIComponent(wsPort)}`;
+        const res = await fetch(`${companionUrl}/api/interfaces`, { cache: "no-store" });
+        const data = (await res.json()) as { selected?: NetworkInterface; interfaces?: NetworkInterface[] };
+        if (isSubscribed && Array.isArray(data.interfaces)) {
+          setInterfaces(data.interfaces);
+        }
       } catch {
-        return status.pairingUrl;
+        // companion offline
       }
+    };
+
+    const timeout = setTimeout(() => {
+      void fetchInterfaces();
+    }, 100);
+
+    return () => {
+      isSubscribed = false;
+      clearTimeout(timeout);
+    };
+  }, [companionUrl, status?.status]);
+
+  // Determine effective host for the QR code
+  const effectiveHost = useMemo(() => {
+    if (selectedHost) return selectedHost;
+    if (status?.hostIp && status.hostIp !== "Unavailable") return status.hostIp;
+    if (interfaces.length > 0 && interfaces[0]?.address) return interfaces[0].address;
+    if (typeof window !== "undefined" && window.location.hostname && window.location.hostname !== "localhost") {
+      return window.location.hostname;
+    }
+    return "127.0.0.1";
+  }, [selectedHost, status?.hostIp, interfaces]);
+
+  const effectivePort = status?.wsPort ?? 4850;
+  const webPort = status?.webPort ?? 3000;
+
+  // Active token and expiration calculation
+  const isExpired = now > localExpiresAt;
+  const secondsLeft = Math.max(0, Math.floor((localExpiresAt - now) / 1000));
+  const minutes = Math.floor(secondsLeft / 60);
+  const seconds = secondsLeft % 60;
+  const formattedCountdown = `${minutes}:${String(seconds).padStart(2, "0")}`;
+
+  // Build the fully functional pairing URL
+  const effectivePairingUrl = useMemo(() => {
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    const currentHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
+
+    if (useCloudUrl && origin) {
+      return `${origin}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
     }
 
-    return status.pairingUrl;
-  }, [status, useCloudUrl]);
+    const baseHost = effectiveHost === "127.0.0.1" || effectiveHost === "localhost" ? currentHost : effectiveHost;
+    return `http://${baseHost}:${webPort}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
+  }, [effectiveHost, effectivePort, localToken, useCloudUrl, webPort]);
 
+  // Generate the QR code data URL whenever the pairing URL changes
   useEffect(() => {
     let active = true;
-    const makeQR = async () => {
+    const generateQRCode = async () => {
       if (!effectivePairingUrl) {
         if (active) setQrDataUrl("");
         return;
       }
       try {
-        const url = await QRCode.toDataURL(effectivePairingUrl, { margin: 1, width: 512 });
+        const url = await QRCode.toDataURL(effectivePairingUrl, {
+          errorCorrectionLevel: "H",
+          margin: 2,
+          width: 512,
+          color: {
+            dark: "#030712",
+            light: "#ffffff",
+          },
+        });
         if (active) setQrDataUrl(url);
-      } catch {
+      } catch (err) {
+        console.error("QR Code generation error:", err);
         if (active) setQrDataUrl("");
       }
     };
-    void makeQR();
+
+    void generateQRCode();
     return () => {
       active = false;
     };
   }, [effectivePairingUrl]);
 
+  // API actions with companion
   const apiAction = async (path: string, payload?: unknown) => {
     setBusy(path);
     try {
@@ -176,9 +234,73 @@ export default function DashboardPage() {
         headers: { "Content-Type": "application/json" },
         body: payload ? JSON.stringify(payload) : undefined,
       });
-      await refresh();
+      // refresh status immediately
+      const res = await fetch(`${companionUrl}/api/status`, { cache: "no-store" });
+      const data = (await res.json()) as CompanionStatus;
+      setStatus(data);
+    } catch {
+      // offline
     } finally {
       setBusy("");
+    }
+  };
+
+  // Generate a fresh pairing QR code (works both with companion online and offline)
+  const generateFreshQR = async () => {
+    setBusy("generate_qr");
+    const newToken = generateToken();
+    const newExpires = Date.now() + 15 * 60_000;
+    setLocalToken(newToken);
+    setLocalExpiresAt(newExpires);
+
+    try {
+      // If companion is online, register the fresh token
+      await fetch(`${companionUrl}/api/pairing/new`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: newToken, ttlMinutes: 15 }),
+      });
+    } catch {
+      // Companion offline, local token already generated
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleCopyLink = async () => {
+    if (!effectivePairingUrl) return;
+    try {
+      await navigator.clipboard.writeText(effectivePairingUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // fallback
+    }
+  };
+
+  const handleDownloadQR = () => {
+    if (!qrDataUrl) return;
+    const a = document.createElement("a");
+    a.href = qrDataUrl;
+    a.download = `mobile-as-cursor-qr-${effectiveHost}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const handleSelectInterface = async (address: string) => {
+    setSelectedHost(address);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(customHostStorageKey, address);
+    }
+    try {
+      await fetch(`${companionUrl}/api/interface/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address }),
+      });
+    } catch {
+      // companion offline
     }
   };
 
@@ -191,34 +313,52 @@ export default function DashboardPage() {
     setShowConfig(false);
   };
 
+  const connectionDuration = useMemo(() => {
+    if (!status?.connectedDevice || !now) return "—";
+    const seconds = Math.max(0, Math.floor((now - status.connectedDevice.connectedAt) / 1000));
+    const min = Math.floor(seconds / 60);
+    const sec = seconds % 60;
+    return `${min}m ${String(sec).padStart(2, "0")}s`;
+  }, [status, now]);
+
+
+  const isCompanionConnected = status && status.status !== "Connection Failed";
+
   const statusColor =
     status?.status === "Connected"
       ? "text-emerald-400"
       : status?.status === "Awaiting Approval"
         ? "text-amber-300"
-        : status?.status === "Connection Failed"
-          ? "text-rose-400"
-          : "text-sky-300";
+        : status?.status === "Ready to Pair"
+          ? "text-cyan-300"
+          : status?.status === "Connection Failed"
+            ? "text-rose-400"
+            : "text-sky-300";
 
   const isHttps = typeof window !== "undefined" && window.location.protocol === "https:";
 
   return (
     <main className="futuristic-bg min-h-screen px-4 py-6 sm:px-7">
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
+        {/* Navigation & Header */}
         <header className="glass-card gradient-border rounded-2xl px-5 py-4">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <h1 className="bg-gradient-to-r from-violet-300 via-cyan-300 to-pink-400 bg-clip-text text-2xl font-bold text-transparent">
                 Mobile as Cursor
               </h1>
-              <p className="text-sm text-slate-300">Desktop pairing dashboard</p>
+              <p className="text-sm text-slate-300">Desktop pairing dashboard &amp; QR manager</p>
             </div>
             <nav className="flex items-center gap-3 text-sm text-slate-200">
               <button
                 onClick={() => setShowConfig((v) => !v)}
-                className="rounded-full bg-cyan-500/20 px-3 py-1.5 text-xs text-cyan-200 hover:bg-cyan-500/30"
+                className={`rounded-full px-3 py-1.5 text-xs transition ${
+                  isCompanionConnected
+                    ? "bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 border border-emerald-500/30"
+                    : "bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 border border-amber-500/30"
+                }`}
               >
-                Companion: {companionUrl.replace(/^https?:\/\//, "")}
+                Companion: {companionUrl.replace(/^https?:\/\//, "")} {isCompanionConnected ? "● Live" : "○ Offline"}
               </button>
               <Link href="/dashboard" className="rounded-full bg-white/10 px-3 py-1.5 hover:bg-white/20">
                 Dashboard
@@ -230,11 +370,12 @@ export default function DashboardPage() {
           </div>
         </header>
 
+        {/* Companion URL Config Drawer */}
         {showConfig ? (
           <div className="glass-card gradient-border rounded-2xl p-4 text-sm text-slate-200">
             <h3 className="font-semibold text-white">Configure Desktop Companion Address</h3>
             <p className="mt-1 text-xs text-slate-400">
-              When deployed to Vercel, the dashboard runs in your browser and connects to your local PC.
+              When deployed to Vercel, the dashboard runs in your browser and talks to the companion on your local computer.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <input
@@ -263,74 +404,185 @@ export default function DashboardPage() {
           </div>
         ) : null}
 
-        {isHttps && companionUrl.startsWith("http://") && status?.status === "Connection Failed" ? (
+        {/* HTTPS Mixed Content Tip */}
+        {isHttps && companionUrl.startsWith("http://") && !isCompanionConnected ? (
           <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">
-            <strong>Notice for HTTPS (Vercel):</strong> Your browser might block mixed-content requests from HTTPS to local HTTP ({companionUrl}). If pairing doesn&apos;t connect, either:
+            <strong>HTTPS Notice:</strong> The dashboard is running securely on HTTPS. If your browser blocks connecting to <code>{companionUrl}</code>:
             <ul className="mt-1 list-disc pl-5 space-y-0.5">
-              <li>Allow insecure content / private network access for this site in your browser site permissions.</li>
-              <li>Or use a tunnel (e.g. Cloudflare Tunnel or ngrok) for companion and set its HTTPS address above.</li>
-              <li>Or access the dashboard locally at <code>http://localhost:3000</code>.</li>
+              <li>You can still scan the QR code below on your phone to connect directly!</li>
+              <li>Or click the lock/settings icon in your browser address bar and allow <em>Insecure content / Local network access</em>.</li>
+              <li>Or run companion through a tunnel (e.g. Cloudflare Tunnel or ngrok) and set its HTTPS address above.</li>
             </ul>
           </div>
         ) : null}
 
-        <section className="grid gap-6 lg:grid-cols-[1.1fr,0.9fr]">
-          <article className="glass-card gradient-border rounded-3xl p-6">
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-xl font-semibold">Pair with Smartphone</h2>
-              <div className={`flex items-center gap-2 text-sm ${statusColor}`}>
-                <span className="status-dot bg-current" />
-                <span>{status?.status ?? "Checking..."}</span>
+        {/* Main Grid: QR Code Studio & Status Sidebar */}
+        <section className="grid gap-6 lg:grid-cols-[1.15fr,0.85fr]">
+          {/* QR Code Presentation Box */}
+          <article className="glass-card gradient-border rounded-3xl p-6 flex flex-col justify-between">
+            <div>
+              {/* Header */}
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-xl font-semibold text-white">Pair with Smartphone</h2>
+                  <p className="text-xs text-slate-400">Scan QR to connect phone trackpad to PC</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`status-dot bg-current ${statusColor}`} />
+                  <span className={`text-sm font-medium ${statusColor}`}>
+                    {status?.status ?? "Ready to Pair"}
+                  </span>
+                </div>
+              </div>
+
+              {/* QR Code Canvas */}
+              <div className="relative mx-auto my-3 flex flex-col items-center justify-center">
+                <div className="relative rounded-3xl bg-white p-5 shadow-[0_0_50px_rgba(56,189,248,0.3)] transition-transform duration-200 hover:scale-[1.01]">
+                  {qrDataUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={qrDataUrl}
+                      alt="Pairing QR code"
+                      className="h-64 w-64 rounded-xl sm:h-72 sm:w-72 object-contain"
+                    />
+                  ) : (
+                    <div className="grid h-64 w-64 sm:h-72 sm:w-72 place-items-center rounded-xl bg-slate-900 text-slate-400 text-sm">
+                      <div className="flex flex-col items-center gap-2">
+                        <span className="animate-spin h-6 w-6 border-2 border-cyan-400 border-t-transparent rounded-full" />
+                        <span>Rendering QR Code...</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Expired Overlay */}
+                  {isExpired ? (
+                    <div className="absolute inset-0 rounded-3xl bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center p-4 text-center">
+                      <p className="text-rose-400 font-semibold text-base mb-1">Token Expired</p>
+                      <p className="text-xs text-slate-300 mb-3">Pairing tokens expire for security.</p>
+                      <button
+                        onClick={generateFreshQR}
+                        className="rounded-xl bg-cyan-400 px-4 py-2 text-xs font-bold text-slate-950 hover:bg-cyan-300"
+                      >
+                        Regenerate QR
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+
+                {/* Expiration Countdown Bar */}
+                <div className="mt-3 flex items-center gap-2 text-xs">
+                  <span className="text-slate-400">Token Validity:</span>
+                  <span
+                    className={`font-mono font-semibold px-2 py-0.5 rounded-full ${
+                      isExpired
+                        ? "bg-rose-500/20 text-rose-300"
+                        : secondsLeft < 120
+                          ? "bg-amber-500/20 text-amber-300"
+                          : "bg-cyan-500/20 text-cyan-200"
+                    }`}
+                  >
+                    {isExpired ? "Expired" : formattedCountdown}
+                  </span>
+                  <button
+                    onClick={generateFreshQR}
+                    className="text-[11px] text-cyan-400 hover:underline ml-1"
+                    title="Click to reset timer and generate new token"
+                  >
+                    Reset
+                  </button>
+                </div>
+              </div>
+
+              {/* Mode & Interface Controls */}
+              <div className="mt-4 space-y-3 rounded-2xl bg-white/5 p-3.5 text-xs text-slate-200">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-slate-300 font-medium">QR Domain Mode:</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setUseCloudUrl(true)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                        useCloudUrl ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
+                      }`}
+                    >
+                      Cloud ({typeof window !== "undefined" ? window.location.host : "Vercel"})
+                    </button>
+                    <button
+                      onClick={() => setUseCloudUrl(false)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                        !useCloudUrl ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
+                      }`}
+                    >
+                      Direct LAN IP
+                    </button>
+                  </div>
+                </div>
+
+                {/* Network Interface Dropdown */}
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10">
+                  <label htmlFor="interface-select" className="text-slate-300 font-medium">
+                    PC Network IP:
+                  </label>
+                  <div className="flex flex-1 max-w-xs items-center gap-2">
+                    <select
+                      id="interface-select"
+                      value={selectedHost}
+                      onChange={(e) => handleSelectInterface(e.target.value)}
+                      className="w-full rounded-lg bg-black/60 px-2.5 py-1 text-xs text-white border border-white/20 outline-none focus:border-cyan-400"
+                    >
+                      {status?.hostIp && status.hostIp !== "Unavailable" ? (
+                        <option value={status.hostIp}>Default: {status.hostIp} ({status.networkName || "Auto"})</option>
+                      ) : null}
+                      {interfaces.map((iface) => (
+                        <option key={iface.address} value={iface.address}>
+                          {iface.name}: {iface.address}
+                        </option>
+                      ))}
+                      <option value="127.0.0.1">Loopback: 127.0.0.1</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Encoded URL Inspector Pill */}
+                <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
+                  <div className="truncate font-mono text-[11px] text-slate-400 max-w-[280px] sm:max-w-md">
+                    {effectivePairingUrl}
+                  </div>
+                  <a
+                    href={effectivePairingUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="shrink-0 text-cyan-300 hover:text-cyan-200 underline text-[11px]"
+                  >
+                    Open test ↗
+                  </a>
+                </div>
               </div>
             </div>
 
-            <div className="mx-auto flex max-w-md items-center justify-center rounded-2xl bg-white p-4 shadow-[0_0_40px_rgba(56,189,248,0.28)]">
-              {qrDataUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={qrDataUrl} alt="Pairing QR code" className="h-full w-full rounded-lg" />
-              ) : (
-                <div className="grid h-72 w-72 place-items-center rounded-lg bg-slate-900 text-slate-300">
-                  {status?.status === "Connection Failed" ? "Companion offline" : "Generating QR..."}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-4 flex items-center justify-center gap-4 text-xs text-slate-300">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={useCloudUrl}
-                  onChange={(e) => setUseCloudUrl(e.target.checked)}
-                  className="rounded"
-                />
-                <span>Generate QR with current domain ({typeof window !== "undefined" ? window.location.host : "cloud"})</span>
-              </label>
-            </div>
-
-            <p className="mt-3 text-center text-sm text-slate-200">
-              Scan this QR code with your smartphone to connect and start controlling your computer.
-            </p>
-
-            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {/* Action Buttons */}
+            <div className="mt-5 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
               <button
-                onClick={() => apiAction("/api/pairing/new")}
-                className="glossy-button rounded-xl bg-cyan-500/20 px-4 py-2 text-sm font-medium text-cyan-100 hover:bg-cyan-500/30"
+                onClick={generateFreshQR}
+                className="glossy-button rounded-xl bg-cyan-500/20 px-3 py-2 text-xs font-medium text-cyan-100 hover:bg-cyan-500/30"
                 disabled={busy.length > 0}
               >
-                Generate Fresh QR
+                {busy === "generate_qr" ? "Generating..." : "Fresh QR"}
               </button>
               <button
-                onClick={async () => {
-                  if (!effectivePairingUrl) return;
-                  await navigator.clipboard.writeText(effectivePairingUrl);
-                }}
-                className="glossy-button rounded-xl bg-violet-500/20 px-4 py-2 text-sm font-medium text-violet-100 hover:bg-violet-500/30"
+                onClick={handleCopyLink}
+                className="glossy-button rounded-xl bg-violet-500/20 px-3 py-2 text-xs font-medium text-violet-100 hover:bg-violet-500/30"
               >
-                Copy Link
+                {copied ? "Copied! ✓" : "Copy Link"}
+              </button>
+              <button
+                onClick={handleDownloadQR}
+                className="glossy-button rounded-xl bg-emerald-500/20 px-3 py-2 text-xs font-medium text-emerald-100 hover:bg-emerald-500/30"
+              >
+                Download PNG
               </button>
               <button
                 onClick={() => apiAction("/api/disconnect")}
-                className="glossy-button rounded-xl bg-rose-500/20 px-4 py-2 text-sm font-medium text-rose-100 hover:bg-rose-500/30"
+                className="glossy-button rounded-xl bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-100 hover:bg-rose-500/30"
                 disabled={busy.length > 0}
               >
                 Disconnect
@@ -338,42 +590,79 @@ export default function DashboardPage() {
             </div>
           </article>
 
-          <aside className="glass-card gradient-border rounded-3xl p-6">
-            <h3 className="text-lg font-semibold">Connection Details</h3>
-            <dl className="mt-4 space-y-3 text-sm text-slate-200">
-              <div className="flex justify-between gap-3"><dt>LAN Interface</dt><dd>{status?.networkName ?? "-"}</dd></div>
-              <div className="flex justify-between gap-3"><dt>Host</dt><dd>{status?.hostIp ?? "-"}</dd></div>
-              <div className="flex justify-between gap-3"><dt>Web Port</dt><dd>{status?.webPort ?? "-"}</dd></div>
-              <div className="flex justify-between gap-3"><dt>WebSocket Port</dt><dd>{status?.wsPort ?? "-"}</dd></div>
-              <div className="flex justify-between gap-3"><dt>Connected Device</dt><dd>{status?.connectedDevice?.deviceLabel ?? "None"}</dd></div>
-              <div className="flex justify-between gap-3"><dt>Duration</dt><dd>{connectionDuration}</dd></div>
-              <div className="flex justify-between gap-3"><dt>Approx Latency</dt><dd>{status?.latencyMs ? `${status.latencyMs} ms` : "—"}</dd></div>
-            </dl>
-
-            {status?.pendingRequest ? (
-              <div className="mt-5 rounded-2xl bg-amber-400/10 p-4 text-sm text-amber-100">
-                <p className="font-semibold">Awaiting approval from desktop</p>
-                <p className="mt-1">Device: {status.pendingRequest.deviceLabel}</p>
-                <div className="mt-3 flex gap-2">
-                  <button
-                    onClick={() => apiAction("/api/pairing/approve", { requestId: status.pendingRequest?.requestId })}
-                    className="rounded-lg bg-emerald-400/20 px-3 py-1.5 hover:bg-emerald-400/35"
-                    disabled={busy.length > 0}
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => apiAction("/api/pairing/reject", { requestId: status.pendingRequest?.requestId })}
-                    className="rounded-lg bg-rose-400/20 px-3 py-1.5 hover:bg-rose-400/35"
-                    disabled={busy.length > 0}
-                  >
-                    Reject
-                  </button>
+          {/* Connection Details & Pairing Approval Section */}
+          <aside className="glass-card gradient-border rounded-3xl p-6 flex flex-col justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-white">Connection Details</h3>
+              <dl className="mt-4 space-y-3 text-sm text-slate-200">
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">Desktop Companion</dt>
+                  <dd className={isCompanionConnected ? "text-emerald-400 font-medium" : "text-amber-400"}>
+                    {isCompanionConnected ? "Running & Ready" : "Offline / Unreachable"}
+                  </dd>
                 </div>
-              </div>
-            ) : null}
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">QR Target Host</dt>
+                  <dd className="font-mono text-cyan-300">{effectiveHost}</dd>
+                </div>
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">WebSocket Port</dt>
+                  <dd className="font-mono">{effectivePort}</dd>
+                </div>
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">Connected Device</dt>
+                  <dd className="font-medium text-white">{status?.connectedDevice?.deviceLabel ?? "None"}</dd>
+                </div>
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">Session Duration</dt>
+                  <dd>{connectionDuration}</dd>
+                </div>
+                <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
+                  <dt className="text-slate-400">Approx Latency</dt>
+                  <dd>{status?.latencyMs ? `${status.latencyMs} ms` : "—"}</dd>
+                </div>
+              </dl>
 
-            {status?.message ? <p className="mt-5 rounded-xl bg-white/10 p-3 text-xs text-slate-200">{status.message}</p> : null}
+              {/* Pending Mobile Pairing Request Card */}
+              {status?.pendingRequest ? (
+                <div className="mt-5 rounded-2xl border border-amber-400/40 bg-amber-400/15 p-4 text-sm text-amber-100 animate-pulse">
+                  <p className="font-semibold text-base">Incoming Mobile Request!</p>
+                  <p className="mt-1 text-xs">Device: <strong>{status.pendingRequest.deviceLabel}</strong></p>
+                  <p className="mt-0.5 text-[11px] text-amber-200/80">Approve this device to allow cursor control.</p>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      onClick={() => apiAction("/api/pairing/approve", { requestId: status.pendingRequest?.requestId })}
+                      className="flex-1 rounded-xl bg-emerald-500 py-2 text-xs font-bold text-slate-950 hover:bg-emerald-400"
+                      disabled={busy.length > 0}
+                    >
+                      Approve Control
+                    </button>
+                    <button
+                      onClick={() => apiAction("/api/pairing/reject", { requestId: status.pendingRequest?.requestId })}
+                      className="flex-1 rounded-xl bg-rose-500/30 py-2 text-xs font-semibold text-rose-200 hover:bg-rose-500/40"
+                      disabled={busy.length > 0}
+                    >
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {status?.message ? (
+                <p className="mt-5 rounded-xl bg-white/10 p-3 text-xs text-slate-300">{status.message}</p>
+              ) : null}
+            </div>
+
+            {/* Quick Flow Instructions */}
+            <div className="mt-6 rounded-2xl bg-white/5 p-4 text-xs text-slate-300">
+              <p className="font-semibold text-white mb-2">How to connect:</p>
+              <ol className="list-decimal pl-4 space-y-1 text-slate-400">
+                <li>Make sure phone and computer are on the same Wi-Fi.</li>
+                <li>Point your phone camera at the QR code and tap the link.</li>
+                <li>Tap <strong>Approve</strong> when prompted here on desktop.</li>
+                <li>Use your phone screen to glide the mouse pointer!</li>
+              </ol>
+            </div>
           </aside>
         </section>
       </div>

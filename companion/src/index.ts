@@ -95,8 +95,11 @@ app.get("/api/status", (_req, res) => {
   res.json(statusPayload());
 });
 
-app.post("/api/pairing/new", (_req, res) => {
-  const token = manager.createToken();
+app.post("/api/pairing/new", (req, res) => {
+  const parsed = z.object({ token: z.string().optional(), ttlMinutes: z.number().optional() }).safeParse(req.body);
+  const ttlMs = parsed.success && parsed.data.ttlMinutes ? parsed.data.ttlMinutes * 60_000 : 15 * 60_000;
+  const customToken = parsed.success ? parsed.data.token : undefined;
+  const token = manager.createToken(ttlMs, customToken);
   res.json({ ok: true, ...statusPayload(`New token created, valid until ${new Date(token.expiresAt).toLocaleTimeString()}`) });
 });
 
@@ -140,20 +143,25 @@ app.post("/api/disconnect", async (_req, res) => {
 });
 
 app.get("/api/interfaces", (_req, res) => {
-  res.json({ selected, interfaces });
+  const currentInterfaces = getIPv4Interfaces();
+  res.json({ selected, interfaces: currentInterfaces });
 });
 
 app.post("/api/interface/select", (req, res) => {
-  const parsed = z.object({ address: z.string() }).safeParse(req.body);
+  const parsed = z.object({ address: z.string(), name: z.string().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ ok: false, error: "invalid_request" });
 
-  const match = interfaces.find((x) => x.address === parsed.data.address);
-  if (!match) return res.status(404).json({ ok: false, error: "interface_not_found" });
-
-  selected = match;
+  const currentInterfaces = getIPv4Interfaces();
+  const match = currentInterfaces.find((x) => x.address === parsed.data.address);
+  if (match) {
+    selected = match;
+  } else {
+    selected = { name: parsed.data.name || "Custom", address: parsed.data.address };
+  }
   manager.createToken();
   res.json({ ok: true, selected, ...statusPayload("Network interface updated.") });
 });
+
 
 app.post("/api/settings", (req, res) => {
   const parsed = settingsSchema.safeParse(req.body);

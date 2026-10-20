@@ -24,14 +24,15 @@ export class SessionManager {
   private active: ActiveSession | null = null;
   private status: PairingStatus = "Disconnected";
 
-  createToken(ttlMs = 2 * 60_000): { token: string; expiresAt: number } {
-    const token = nanoid(32);
+  createToken(ttlMs = 15 * 60_000, customToken?: string): { token: string; expiresAt: number } {
+    const token = customToken && customToken.trim().length > 0 ? customToken.trim() : nanoid(32);
     const expiresAt = Date.now() + ttlMs;
     this.pairingToken = { value: token, expiresAt, consumed: false };
     this.pending = null;
     if (!this.active) this.status = "Ready to Pair";
     return { token, expiresAt };
   }
+
 
   currentToken(): { value: string; expiresAt: number; consumed: boolean } | null {
     if (!this.pairingToken) return null;
