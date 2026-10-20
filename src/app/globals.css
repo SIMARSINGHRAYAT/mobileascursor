@@ -1,0 +1,162 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: #000;
+  color: #f8fafc;
+}
+
+body {
+  font-family: Inter, SF Pro Text, Segoe UI, Roboto, sans-serif;
+}
+
+@keyframes gridShift {
+  0% {
+    background-position: 0 0, 0 0;
+  }
+  100% {
+    background-position: 120px 120px, -120px -120px;
+  }
+}
+
+@keyframes glowPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes shineSweep {
+  0% {
+    transform: translateX(-120%) rotate(14deg);
+  }
+  100% {
+    transform: translateX(180%) rotate(14deg);
+  }
+}
+
+.futuristic-bg {
+  position: relative;
+  overflow: hidden;
+  background-color: #000;
+  background-image:
+    radial-gradient(circle at 15% 20%, rgba(139, 92, 246, 0.18), transparent 45%),
+    radial-gradient(circle at 85% 15%, rgba(34, 211, 238, 0.2), transparent 40%),
+    radial-gradient(circle at 80% 70%, rgba(244, 114, 182, 0.2), transparent 38%),
+    radial-gradient(circle at 20% 80%, rgba(163, 230, 53, 0.16), transparent 42%),
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    100% 100%,
+    100% 100%,
+    100% 100%,
+    44px 44px,
+    44px 44px;
+  animation: gridShift 20s linear infinite;
+}
+
+.futuristic-bg::before,
+.futuristic-bg::after {
+  content: "";
+  position: absolute;
+  border-radius: 9999px;
+  pointer-events: none;
+  filter: blur(24px);
+  animation: glowPulse 8s ease-in-out infinite;
+}
+
+.futuristic-bg::before {
+  width: 22rem;
+  height: 22rem;
+  right: -5rem;
+  bottom: -5rem;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.45), rgba(14, 165, 233, 0.1), transparent 70%);
+}
+
+.futuristic-bg::after {
+  width: 18rem;
+  height: 18rem;
+  left: -4rem;
+  top: 20%;
+  background: radial-gradient(circle, rgba(236, 72, 153, 0.35), rgba(139, 92, 246, 0.1), transparent 70%);
+}
+
+.glass-card {
+  background: linear-gradient(140deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 22px 64px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.gradient-border {
+  position: relative;
+}
+
+.gradient-border::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(120deg, #8b5cf6, #3b82f6, #22d3ee, #10b981, #a3e635, #facc15, #fb923c, #ec4899, #a855f7);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.glossy-button {
+  position: relative;
+  overflow: hidden;
+}
+
+.glossy-button::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.25) 50%, transparent 75%);
+  transform: translateX(-120%) rotate(14deg);
+}
+
+.glossy-button:hover::after {
+  animation: shineSweep 0.9s ease;
+}
+
+.status-dot {
+  width: 0.72rem;
+  height: 0.72rem;
+  border-radius: 999px;
+  box-shadow: 0 0 14px currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .futuristic-bg,
+  .futuristic-bg::before,
+  .futuristic-bg::after,
+  .glossy-button::after {
+    animation: none !important;
+  }
+}
