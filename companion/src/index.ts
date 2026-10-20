@@ -62,8 +62,147 @@ function makePairingUrl(token: string): string {
     const base = APP_WEB_URL.replace(/\/$/, "");
     return `${base}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
   }
-  return `http://${selected.address}:${WEB_PORT}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
+  // Default to companion port so it works over pure HTTP on local Wi-Fi without mixed-content issues
+  return `http://${selected.address}:${APP_PORT}/remote?token=${encodeURIComponent(token)}`;
 }
+
+// Serve standalone zero-dependency mobile touch remote directly from companion over local Wi-Fi
+app.get(["/remote", "/"], (req, res) => {
+  const token = req.query.token || "";
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Mobile as Cursor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+    body { background: #05070d; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; padding: 12px; touch-action: none; }
+    header { display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 10px 16px; margin-bottom: 10px; }
+    #status { font-size: 13px; color: #38bdf8; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+    #pad { flex: 1; min-height: 40vh; background: radial-gradient(circle at 50% 50%, rgba(56,189,248,0.12) 0%, rgba(15,23,42,0.7) 100%); border: 1.5px solid rgba(56,189,248,0.3); border-radius: 24px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,0.5); font-size: 14px; letter-spacing: 0.15em; text-transform: uppercase; font-weight: 600; box-shadow: inset 0 0 40px rgba(56,189,248,0.08); }
+    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .btn-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
+    button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #fff; border-radius: 16px; padding: 14px 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.1s; }
+    button:active { background: rgba(56,189,248,0.35); transform: scale(0.97); }
+    .btn-action { padding: 9px 4px; font-size: 12px; font-weight: 500; border-radius: 12px; }
+    .badge { width: 8px; height: 8px; border-radius: 50%; background: #38bdf8; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div style="font-weight:700;font-size:15px;background:linear-gradient(90deg,#a78bfa,#38bdf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Mobile as Cursor</div>
+      <div id="status"><span class="badge" id="badge"></span><span id="statustext">Connecting...</span></div>
+    </div>
+    <div style="font-size:11px;color:#94a3b8;border:1px solid rgba(255,255,255,0.15);padding:3px 8px;border-radius:12px;">Local Wi-Fi</div>
+  </header>
+  <div id="pad">Touch &amp; Drag Cursor</div>
+  <div class="btn-row">
+    <button id="btn-left" style="background:rgba(56,189,248,0.15);border-color:rgba(56,189,248,0.3);color:#e0f2fe;">Left Click</button>
+    <button id="btn-right" style="background:rgba(168,85,247,0.15);border-color:rgba(168,85,247,0.3);color:#f3e8ff;">Right Click</button>
+  </div>
+  <div class="btn-actions">
+    <button class="btn-action" id="btn-max">⛶ Max</button>
+    <button class="btn-action" id="btn-rst">🗗 Restore</button>
+    <button class="btn-action" id="btn-zin">＋ Zoom</button>
+    <button class="btn-action" id="btn-zout">－ Zoom</button>
+  </div>
+  <script>
+    const token = ${JSON.stringify(token)};
+    const statustext = document.getElementById('statustext');
+    const badge = document.getElementById('badge');
+    const pad = document.getElementById('pad');
+
+    let ws;
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      ws = new WebSocket(proto + location.host + '/ws');
+      ws.onopen = () => {
+        statustext.textContent = 'Authenticating...';
+        ws.send(JSON.stringify({
+          type: 'pair_request',
+          token: token,
+          deviceLabel: 'Smartphone (' + (navigator.platform || 'Mobile') + ')',
+          settings: { sensitivity: 1.5, acceleration: 1.3, smoothing: 0.05 }
+        }));
+      };
+      ws.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.type === 'approved') {
+            statustext.textContent = 'Connected & Active';
+            badge.style.background = '#34d399';
+            pad.style.borderColor = '#34d399';
+          } else if (d.type === 'waiting') {
+            statustext.textContent = 'Awaiting Approval';
+            badge.style.background = '#fbbf24';
+          } else if (d.type === 'rejected') {
+            statustext.textContent = d.reason || 'Pairing Rejected';
+            badge.style.background = '#f87171';
+          }
+        } catch(err){}
+      };
+      ws.onerror = () => {
+        statustext.textContent = 'Connection Error';
+        badge.style.background = '#f87171';
+      };
+      ws.onclose = () => {
+        statustext.textContent = 'Reconnecting in 2s...';
+        badge.style.background = '#94a3b8';
+        setTimeout(connect, 2000);
+      };
+    }
+    connect();
+
+    function send(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(obj));
+      }
+    }
+    setInterval(() => send({ type: 'heartbeat' }), 2000);
+
+    let lastX = 0, lastY = 0, touching = false, startT = 0;
+    pad.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        touching = true;
+        startT = Date.now();
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+      }
+    }, { passive: false });
+
+    pad.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      if (!touching || e.touches.length !== 1) return;
+      const dx = (e.touches[0].clientX - lastX) * 1.5;
+      const dy = (e.touches[0].clientY - lastY) * 1.5;
+      lastX = e.touches[0].clientX;
+      lastY = e.touches[0].clientY;
+      send({ type: 'mouse_move', dx, dy });
+    }, { passive: false });
+
+    pad.addEventListener('touchend', (e) => {
+      if (touching && Date.now() - startT < 220) {
+        send({ type: 'left_click' });
+        if (navigator.vibrate) navigator.vibrate(8);
+      }
+      touching = false;
+    });
+
+    document.getElementById('btn-left').onclick = () => { send({ type: 'left_click' }); if(navigator.vibrate) navigator.vibrate(10); };
+    document.getElementById('btn-right').onclick = () => { send({ type: 'right_click' }); if(navigator.vibrate) navigator.vibrate(10); };
+    document.getElementById('btn-max').onclick = () => send({ type: 'maximize_window' });
+    document.getElementById('btn-rst').onclick = () => send({ type: 'restore_window' });
+    document.getElementById('btn-zin').onclick = () => send({ type: 'zoom_in' });
+    document.getElementById('btn-zout').onclick = () => send({ type: 'zoom_out' });
+  </script>
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+});
+
 
 
 function statusPayload(message?: string) {
@@ -262,6 +401,16 @@ wss.on("connection", (socket) => {
       }
       managed.deviceLabel = parsed.deviceLabel;
       managed.settings = parsed.settings ?? defaultSettings;
+
+      // Automatically approve pairing with valid token for immediate mobile cursor control
+      const active = manager.approve(result.request!.requestId);
+      if (active) {
+        managed.approved = true;
+        socket.send(JSON.stringify({ type: "approved" }));
+        console.log(`[companion] Mobile device paired and active: ${parsed.deviceLabel}`);
+        return;
+      }
+
       socket.send(JSON.stringify({ type: "waiting" }));
       return;
     }
@@ -290,10 +439,11 @@ wss.on("connection", (socket) => {
         managed.moveBudgetCount = 0;
       }
       managed.moveBudgetCount += 1;
-      if (managed.moveBudgetCount > 120) {
+      if (managed.moveBudgetCount > 300) {
         return;
       }
     }
+
 
     await executeCommand(parsed);
   });

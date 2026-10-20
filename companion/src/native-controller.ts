@@ -1,7 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 export interface NativeController {
   move(dx: number, dy: number): Promise<void>;
@@ -19,86 +18,146 @@ export interface NativeController {
   releaseAllButtons(): Promise<void>;
 }
 
-function ps(script: string): Promise<void> {
-  return execFileAsync(
-    "powershell",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-    { windowsHide: true },
-  ).then(() => undefined);
-}
+class FastWindowsNativeController implements NativeController {
+  private proc: ChildProcessWithoutNullStreams | null = null;
+  private exePath = "";
 
-class WindowsPowerShellController implements NativeController {
-  private readonly user32Prelude = `Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class Native {
-  [DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y);
-  [DllImport(\"user32.dll\")] public static extern bool GetCursorPos(out POINT pt);
-  [DllImport(\"user32.dll\")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
-  [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();
-  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-}
-"@;`;
+  constructor() {
+    this.init();
+  }
 
-  private async run(body: string): Promise<void> {
-    await ps(`${this.user32Prelude} ${body}`);
+  private init() {
+    try {
+      this.exePath = this.resolveOrCompile();
+      this.startProcess();
+    } catch (err) {
+      console.error("[native-controller] Failed to initialize native injector:", err);
+    }
+  }
+
+  private resolveOrCompile(): string {
+    const candidatePaths = [
+      path.resolve(__dirname, "../input-injector.exe"),
+      path.resolve(__dirname, "../../companion/input-injector.exe"),
+      path.resolve(process.cwd(), "companion/input-injector.exe"),
+      path.resolve(process.cwd(), "input-injector.exe"),
+    ];
+
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        return p;
+      }
+    }
+
+    // Attempt to compile using csc.exe if available
+    const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
+    const srcPath = path.resolve(__dirname, "input-injector.cs");
+    const fallbackSrcPath = path.resolve(process.cwd(), "companion/src/input-injector.cs");
+    const actualSrc = fs.existsSync(srcPath) ? srcPath : (fs.existsSync(fallbackSrcPath) ? fallbackSrcPath : "");
+
+    const outPath = candidatePaths[0];
+
+    if (fs.existsSync(cscPath) && actualSrc) {
+      console.log(`[native-controller] Compiling input-injector.exe with csc.exe...`);
+      execFileSync(cscPath, [
+        "/nologo",
+        "/optimize",
+        "/target:winexe",
+        `/out:${outPath}`,
+        "/reference:System.Windows.Forms.dll",
+        actualSrc,
+      ]);
+      return outPath;
+    }
+
+    throw new Error("Could not find or compile input-injector.exe");
+  }
+
+  private startProcess() {
+    if (!this.exePath || !fs.existsSync(this.exePath)) return;
+
+    this.proc = spawn(this.exePath, [], {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    this.proc.stdout.on("data", (data) => {
+      const msg = data.toString().trim();
+      if (msg.includes("READY")) {
+        console.log("[native-controller] Fast native input injector READY");
+      }
+    });
+
+    this.proc.on("error", (err) => {
+      console.error("[native-controller] Input injector error:", err);
+    });
+
+    this.proc.on("exit", (code) => {
+      console.warn(`[native-controller] Input injector exited with code ${code}. Restarting...`);
+      this.proc = null;
+      setTimeout(() => this.startProcess(), 500);
+    });
+  }
+
+  private sendCommand(cmd: string) {
+    if (!this.proc || !this.proc.stdin || this.proc.killed) {
+      this.startProcess();
+    }
+    if (this.proc && this.proc.stdin.writable) {
+      this.proc.stdin.write(`${cmd}\n`);
+    }
   }
 
   async move(dx: number, dy: number): Promise<void> {
-    const x = Math.round(dx);
-    const y = Math.round(dy);
-    await this.run(`$p=New-Object Native+POINT; [Native]::GetCursorPos([ref]$p)|Out-Null; [Native]::SetCursorPos($p.X+${x},$p.Y+${y})|Out-Null;`);
+    this.sendCommand(`m ${dx} ${dy}`);
   }
 
   async leftClick(): Promise<void> {
-    await this.run("[Native]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero); [Native]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero);");
+    this.sendCommand("lc");
   }
 
   async rightClick(): Promise<void> {
-    await this.run("[Native]::mouse_event(0x0008,0,0,0,[UIntPtr]::Zero); [Native]::mouse_event(0x0010,0,0,0,[UIntPtr]::Zero);");
+    this.sendCommand("rc");
   }
 
   async doubleClick(): Promise<void> {
-    await this.leftClick();
-    await this.leftClick();
+    this.sendCommand("dc");
   }
 
   async scroll(deltaY: number): Promise<void> {
-    const amt = Math.round(deltaY * -10);
-    await this.run(`[Native]::mouse_event(0x0800,0,0,${amt},[UIntPtr]::Zero);`);
+    this.sendCommand(`s ${deltaY}`);
   }
 
   async dragStart(): Promise<void> {
-    await this.run("[Native]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero);");
+    this.sendCommand("ld");
   }
 
   async dragEnd(): Promise<void> {
-    await this.run("[Native]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero);");
+    this.sendCommand("lu");
   }
 
   async maximizeWindow(): Promise<void> {
-    await this.run("$w=[Native]::GetForegroundWindow(); if($w -ne [IntPtr]::Zero){[Native]::ShowWindow($w,3)|Out-Null}");
+    this.sendCommand("max");
   }
 
   async restoreWindow(): Promise<void> {
-    await this.run("$w=[Native]::GetForegroundWindow(); if($w -ne [IntPtr]::Zero){[Native]::ShowWindow($w,9)|Out-Null}");
+    this.sendCommand("rst");
   }
 
   async zoomIn(): Promise<void> {
-    await ps("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^+{ADD}')");
+    this.sendCommand("zi");
   }
 
   async zoomOut(): Promise<void> {
-    await ps("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^-')");
+    this.sendCommand("zo");
   }
 
   async resetZoom(): Promise<void> {
-    await ps("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^0')");
+    this.sendCommand("zr");
   }
 
   async releaseAllButtons(): Promise<void> {
-    await this.run("[Native]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero); [Native]::mouse_event(0x0010,0,0,0,[UIntPtr]::Zero);");
+    this.sendCommand("rel");
   }
 }
 
@@ -119,6 +178,6 @@ class NoopController implements NativeController {
 }
 
 export function createNativeController(): NativeController {
-  if (process.platform === "win32") return new WindowsPowerShellController();
+  if (process.platform === "win32") return new FastWindowsNativeController();
   return new NoopController();
 }

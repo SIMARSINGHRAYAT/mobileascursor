@@ -48,14 +48,22 @@ export default function DashboardPage() {
 
   const [status, setStatus] = useState<CompanionStatus | null>(null);
   const [localToken, setLocalToken] = useState<string>(() => generateToken());
+
+
   const [localExpiresAt, setLocalExpiresAt] = useState<number>(() => Date.now() + 15 * 60_000);
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
+
   const [busy, setBusy] = useState<string>("");
   const [now, setNow] = useState<number>(() => Date.now());
+
   const [showConfig, setShowConfig] = useState(false);
+
   const [customUrlInput, setCustomUrlInput] = useState(companionUrl);
-  const [useCloudUrl, setUseCloudUrl] = useState(true);
+  const [pairingMode, setPairingMode] = useState<"direct" | "cloud" | "lan_web">("direct");
   const [copied, setCopied] = useState(false);
+
+
+
 
   // Network interfaces from companion
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
@@ -185,14 +193,19 @@ export default function DashboardPage() {
   const effectivePairingUrl = useMemo(() => {
     const origin = typeof window !== "undefined" ? window.location.origin : "";
     const currentHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
+    const hostForUrl = effectiveHost === "127.0.0.1" || effectiveHost === "localhost" ? currentHost : effectiveHost;
 
-    if (useCloudUrl && origin) {
+    if (pairingMode === "direct") {
+      return `http://${hostForUrl}:${effectivePort}/remote?token=${encodeURIComponent(localToken)}`;
+    }
+
+    if (pairingMode === "cloud" && origin) {
       return `${origin}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
     }
 
-    const baseHost = effectiveHost === "127.0.0.1" || effectiveHost === "localhost" ? currentHost : effectiveHost;
-    return `http://${baseHost}:${webPort}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
-  }, [effectiveHost, effectivePort, localToken, useCloudUrl, webPort]);
+    return `http://${hostForUrl}:${webPort}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
+  }, [effectiveHost, effectivePort, localToken, pairingMode, webPort]);
+
 
   // Generate the QR code data URL whenever the pairing URL changes
   useEffect(() => {
@@ -496,26 +509,36 @@ export default function DashboardPage() {
               {/* Mode & Interface Controls */}
               <div className="mt-4 space-y-3 rounded-2xl bg-white/5 p-3.5 text-xs text-slate-200">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-slate-300 font-medium">QR Domain Mode:</span>
-                  <div className="flex items-center gap-2">
+                  <span className="text-slate-300 font-medium">QR Connection Mode:</span>
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <button
-                      onClick={() => setUseCloudUrl(true)}
+                      onClick={() => setPairingMode("direct")}
                       className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                        useCloudUrl ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
+                        pairingMode === "direct" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
+                      }`}
+                      title="Direct connection to companion port 4850 over local Wi-Fi without SSL mixed-content restrictions"
+                    >
+                      ⚡ Direct Wi-Fi (Best)
+                    </button>
+                    <button
+                      onClick={() => setPairingMode("cloud")}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
+                        pairingMode === "cloud" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
                       }`}
                     >
                       Cloud ({typeof window !== "undefined" ? window.location.host : "Vercel"})
                     </button>
                     <button
-                      onClick={() => setUseCloudUrl(false)}
+                      onClick={() => setPairingMode("lan_web")}
                       className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                        !useCloudUrl ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
+                        pairingMode === "lan_web" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
                       }`}
                     >
-                      Direct LAN IP
+                      LAN Web (:3000)
                     </button>
                   </div>
                 </div>
+
 
                 {/* Network Interface Dropdown */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10">

@@ -363,14 +363,28 @@ export default function RemotePage() {
       </div>
 
       {socketState !== "connected" ? (
-        <div className="mt-3 text-center text-xs text-amber-200">
+        <div className="mt-3 text-center text-xs space-y-2">
           {!token ? (
-            <span>Scan QR code from desktop dashboard to obtain pairing token.</span>
+            <p className="text-amber-200">Scan QR code from desktop dashboard to obtain pairing token.</p>
           ) : (
-            <span>Connection must be approved on your desktop PC dashboard.</span>
+            <p className="text-slate-300">Connecting to desktop at <strong className="font-mono text-cyan-300">{wsHost}:{wsPort}</strong>...</p>
           )}
+
+          {typeof window !== "undefined" && window.location.protocol === "https:" && wsHost && !wsHost.startsWith("wss://") ? (
+            <div className="rounded-xl border border-amber-500/40 bg-amber-500/15 p-2.5 text-[11px] text-amber-200 text-left">
+              <p className="font-semibold text-amber-100">💡 Mobile Browser Notice:</p>
+              <p className="mt-0.5 text-slate-300">If cursor doesn&apos;t move, your phone&apos;s browser may have blocked local Wi-Fi from HTTPS.</p>
+              <a
+                href={`http://${wsHost}:${wsPort}/remote?token=${encodeURIComponent(token)}`}
+                className="mt-2 block w-full text-center rounded-lg bg-cyan-400 py-2 font-bold text-slate-950"
+              >
+                Switch to Direct Local Wi-Fi Controller ↗
+              </a>
+            </div>
+          ) : null}
         </div>
       ) : null}
+
 
       <div className="mt-2 text-center text-[11px] text-slate-400">
         Need help? <Link href="/dashboard" className="underline">Open desktop dashboard</Link>
