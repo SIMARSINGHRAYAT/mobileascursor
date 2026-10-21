@@ -158,6 +158,10 @@ export class CloudRelayClient {
       const postReq = https.request(`https://ntfy.sh/${topic}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        timeout: 6000,
+      });
+      postReq.on("error", () => {
+        // Silently catch transient network resets
       });
       postReq.write(JSON.stringify(payload));
       postReq.end();

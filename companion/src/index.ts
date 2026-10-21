@@ -21,6 +21,14 @@ type ManagedSocket = {
   moveBudgetWindowStart: number;
 };
 
+// Guard against transient network disconnects / ECONNRESET
+process.on("uncaughtException", (err) => {
+  console.warn("[companion] Network notice (resilient):", err.message);
+});
+process.on("unhandledRejection", (reason) => {
+  console.warn("[companion] Network promise rejection (resilient):", reason);
+});
+
 // Parse command line arguments: --relay <url>, --port <port>
 const cliArgs = process.argv.slice(2);
 let cliRelayUrl: string | undefined;
