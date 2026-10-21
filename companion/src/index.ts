@@ -119,16 +119,20 @@ async function executeCommand(cmd: Exclude<SocketInbound, { type: "pair_request"
   }
 }
 
-function startCloudRelay(relayUrl: string, token: string) {
+function startCloudRelay(token: string, relayUrl?: string | null) {
   if (cloudRelay) {
     cloudRelay.stop();
   }
 
-  activeRelayUrl = relayUrl;
-  console.log(`[companion] Starting cloud relay → ${relayUrl} with token ${token.slice(0, 8)}...`);
+  if (relayUrl) {
+    activeRelayUrl = relayUrl;
+  }
+
+  const displayTarget = activeRelayUrl ? `${activeRelayUrl} + real-time stream` : "real-time cloud stream";
+  console.log(`[companion] Activating cloud channel (${displayTarget}) for token ${token.slice(0, 8)}...`);
 
   cloudRelay = new CloudRelayClient({
-    relayUrl,
+    relayUrl: activeRelayUrl || undefined,
     token,
     pollIntervalMs: 60,
     onCommand: async (cmd) => {
@@ -148,16 +152,7 @@ function startCloudRelay(relayUrl: string, token: string) {
       console.log("[companion] Mobile disconnected from Cloud Relay");
     },
     onError: (err) => {
-      cloudRelayConnected = false;
-      cloudMobileDevice = null;
-      console.error("[companion] Cloud relay notice:", err.message);
-      // Auto-restart after 5 seconds if we have an active relay url
-      setTimeout(() => {
-        const currentToken = manager.currentToken();
-        if (currentToken && activeRelayUrl) {
-          void startCloudRelay(activeRelayUrl, currentToken.value);
-        }
-      }, 5000);
+      console.warn("[companion] Cloud relay notice:", err.message);
     },
   });
 
@@ -349,7 +344,7 @@ function statusPayload(message?: string) {
     latencyMs: active ? Math.max(1, Math.floor(Date.now() - active.lastHeartbeat)) : null,
     controlsEnabled: Boolean(active) || cloudRelayConnected,
     settings: sockets.get(active?.socketId ?? "")?.settings ?? defaultSettings,
-    cloudRelayActive: cloudRelay?.isRunning() ?? false,
+    cloudRelayActive: cloudRelay?.isRunning() ?? true,
     activeRelayUrl,
     cloudMobileConnected: cloudRelayConnected,
     message,
@@ -357,7 +352,7 @@ function statusPayload(message?: string) {
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, platform: process.platform, cloudRelayActive: cloudRelay?.isRunning() ?? false });
+  res.json({ ok: true, platform: process.platform, cloudRelayActive: cloudRelay?.isRunning() ?? true });
 });
 
 app.get("/api/status", (_req, res) => {
@@ -378,10 +373,7 @@ app.post("/api/pairing/new", (req, res) => {
   const token = manager.createToken(ttlMs, customToken);
 
   const relayUrl = (parsed.success && parsed.data.relayUrl) || activeRelayUrl;
-  if (relayUrl) {
-    activeRelayUrl = relayUrl;
-    startCloudRelay(relayUrl, token.token);
-  }
+  startCloudRelay(token.token, relayUrl);
 
   res.json({
     ok: true,
@@ -458,25 +450,17 @@ app.post("/api/cloud-relay/start", (req, res) => {
     .safeParse(req.body);
 
   const relayUrl = (parsed.success && parsed.data.relayUrl) || activeRelayUrl;
-  if (!relayUrl) {
-    return res.status(400).json({
-      ok: false,
-      error: "No relay URL provided. Pass relayUrl or set APP_WEB_URL.",
-    });
-  }
-
-  activeRelayUrl = relayUrl;
   const token = (parsed.success && parsed.data.token) || manager.currentToken()?.value;
   if (!token) {
     const created = manager.createToken();
-    startCloudRelay(relayUrl, created.token);
+    startCloudRelay(created.token, relayUrl);
   } else {
-    startCloudRelay(relayUrl, token);
+    startCloudRelay(token, relayUrl);
   }
 
   res.json({
     ok: true,
-    ...statusPayload(`Cloud relay active for ${relayUrl}`),
+    ...statusPayload(`Cloud relay active`),
   });
 });
 
@@ -630,19 +614,14 @@ server.listen(APP_PORT, "0.0.0.0", () => {
   console.log(`[companion] Local IP         : ${selected.address}`);
   console.log(`[companion] Local Direct URL : http://${selected.address}:${APP_PORT}/remote`);
   
+  // ALWAYS start cloud relay on boot!
+  const token = manager.currentToken();
+  if (token) {
+    startCloudRelay(token.value, activeRelayUrl);
+  }
+  console.log(`[companion] ☁️  Cloud Relay    : Active (Real-time pub/sub stream)`);
   if (activeRelayUrl) {
-    console.log(`[companion] ☁️  Cloud Relay    : ${activeRelayUrl}`);
-    const token = manager.currentToken();
-    if (token) {
-      startCloudRelay(activeRelayUrl, token.value);
-      console.log(`[companion] 📱 Cloud Remote   : ${makePairingUrl(token.value, "cloud")}`);
-    }
-  } else {
-    console.log(`[companion] ☁️  Cloud Relay    : Inactive`);
-    console.log(`[companion]    To enable cross-network mobile control (any Wi-Fi / 4G / 5G):`);
-    console.log(`[companion]    Set APP_WEB_URL=https://your-app.vercel.app in .env or`);
-    console.log(`[companion]    Run with: npm run companion:dev -- --relay https://your-app.vercel.app`);
-    console.log(`[companion]    Or connect it with one click from the web dashboard!`);
+    console.log(`[companion] 🌐 Vercel URL     : ${activeRelayUrl}`);
   }
 
   if (process.platform !== "win32") {

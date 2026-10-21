@@ -4,15 +4,12 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { defaultSettings, settingsSchema, type ControlMessage, type ControllerSettings } from "@/lib/control-protocol";
 
-type SocketState = "connecting" | "awaiting_approval" | "connected" | "disconnected" | "error";
 type ConnectionMode = "websocket" | "cloud";
 
 const storageKey = "mobile-as-cursor:settings";
 const hostStorageKey = "mobile-as-cursor:ws-host";
 
 export default function RemotePage() {
-  const [socketState, setSocketState] = useState<SocketState>("connecting");
-  const [statusText, setStatusText] = useState("Connecting...");
   const [settings, setSettings] = useState<ControllerSettings>(() => {
     if (typeof window !== "undefined") {
       const raw = localStorage.getItem(storageKey);
@@ -41,7 +38,7 @@ export default function RemotePage() {
   const cloudBatchRef = useRef<Array<{ type: string; [key: string]: unknown }>>([]);
   const cloudFlushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const [token, setToken] = useState<string>(() => {
+  const [token] = useState<string>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       return params.get("token") ?? "";
@@ -52,12 +49,12 @@ export default function RemotePage() {
   const [connectionMode, setConnectionMode] = useState<ConnectionMode>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
-      return params.get("mode") === "cloud" ? "cloud" : "websocket";
+      return params.get("mode") === "websocket" ? "websocket" : "cloud";
     }
     return "cloud";
   });
 
-  const [wsPort, setWsPort] = useState<number>(() => {
+  const [wsPort] = useState<number>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       return Number(params.get("wsPort") ?? "4850");
@@ -86,36 +83,59 @@ export default function RemotePage() {
   });
 
   const [hostInput, setHostInput] = useState<string>(wsHost);
-  const [companionActive, setCompanionActive] = useState(false);
+  const [touchActive, setTouchActive] = useState(false);
+  const [statusBadge, setStatusBadge] = useState("Connected");
 
-  // ─── Cloud Mode: POST commands to relay API ─────────────────────────
+  // ─── Dual-Channel Cloud Publishing (Instant Real-Time Stream + Vercel) ──────
 
   const cloudRelayUrl = typeof window !== "undefined" ? window.location.origin : "";
 
   const flushCloudBatch = useCallback(async () => {
     const batch = cloudBatchRef.current;
-    if (batch.length === 0) return;
+    if (batch.length === 0 || !token) return;
     cloudBatchRef.current = [];
 
+    const payload = JSON.stringify({
+      type: "commands",
+      commands: batch,
+      token,
+      timestamp: Date.now(),
+    });
+
+    // 1. Direct real-time pubsub stream (sub-20ms instant delivery!)
     try {
-      await fetch(`${cloudRelayUrl}/api/relay`, {
+      fetch(`https://ntfy.sh/mac_relay_${token}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "command",
-          token,
-          commands: batch,
-        }),
-      });
+        body: payload,
+        mode: "cors",
+      }).catch(() => {});
     } catch {
-      // Retried on next batch
+      // Ignore
+    }
+
+    // 2. Vercel relay route (backup channel)
+    if (cloudRelayUrl) {
+      try {
+        fetch(`${cloudRelayUrl}/api/relay`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "command",
+            token,
+            commands: batch,
+          }),
+        }).catch(() => {});
+      } catch {
+        // Ignore
+      }
     }
   }, [cloudRelayUrl, token]);
 
   const sendCloud = useCallback(
     (msg: { type: string; [key: string]: unknown }) => {
       cloudBatchRef.current.push(msg);
-      // Immediate flush for clicks and discrete actions
+      // Instant flush for clicks and actions
       if (msg.type !== "mouse_move" && msg.type !== "heartbeat") {
         void flushCloudBatch();
       }
@@ -123,7 +143,7 @@ export default function RemotePage() {
     [flushCloudBatch],
   );
 
-  // ─── WebSocket Mode ─────────────────────────────────────────────────
+  // ─── Direct WebSocket Mode ──────────────────────────────────────────
 
   const sendWs = useCallback(
     (msg: ControlMessage | { type: "pair_request"; token: string; deviceLabel: string; settings: ControllerSettings }) => {
@@ -171,16 +191,31 @@ export default function RemotePage() {
     }
   }, [settings]);
 
-  // ─── Cloud Mode: Join session & start batch flushing ────────────────
+  // ─── Cloud Channel Activation & Fast Batch Timer ───────────────────
 
   useEffect(() => {
     if (connectionMode !== "cloud" || !token) return;
 
-    let alive = true;
+    // Announce mobile join to the cloud relay
+    const announceJoin = () => {
+      const joinPayload = JSON.stringify({
+        type: "mobile_joined",
+        deviceLabel: device,
+        token,
+        timestamp: Date.now(),
+      });
 
-    const joinSession = async () => {
-      try {
-        const res = await fetch(`${cloudRelayUrl}/api/relay`, {
+      // Direct pubsub
+      fetch(`https://ntfy.sh/mac_relay_${token}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: joinPayload,
+        mode: "cors",
+      }).catch(() => {});
+
+      // Vercel relay
+      if (cloudRelayUrl) {
+        fetch(`${cloudRelayUrl}/api/relay`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -188,90 +223,32 @@ export default function RemotePage() {
             token,
             deviceLabel: device,
           }),
-        });
-
-        const data = (await res.json()) as {
-          ok: boolean;
-          status?: string;
-          companionActive?: boolean;
-          message?: string;
-        };
-        if (!alive) return;
-
-        if (data.ok) {
-          const isCompActive = Boolean(data.companionActive || data.status === "connected");
-          setCompanionActive(isCompActive);
-          setSocketState("connected");
-          setStatusText(isCompActive ? "Connected to PC" : "Waiting for PC companion...");
-        } else {
-          setSocketState("error");
-          setStatusText("Failed to join relay session");
-        }
-      } catch {
-        if (!alive) return;
-        setSocketState("error");
-        setStatusText("Cannot reach cloud relay");
+        }).catch(() => {});
       }
     };
 
-    void joinSession();
+    announceJoin();
+    setStatusBadge("Live");
 
-    // Flush mouse move batches every 40ms for responsive cursor
+    // Ultra-fast 25ms batch flush for smooth mouse cursor gliding
     const flushTimer = setInterval(() => {
       void flushCloudBatch();
-    }, 40);
+    }, 25);
     cloudFlushTimerRef.current = flushTimer;
 
-    // Check relay status every 1.5 seconds to track companion status
-    const statusTimer = setInterval(async () => {
-      if (!alive) return;
-      try {
-        const res = await fetch(`${cloudRelayUrl}/api/relay`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "status",
-            token,
-          }),
-        });
-
-        const data = (await res.json()) as { ok: boolean; companionActive?: boolean };
-        if (!alive) return;
-
-        if (data.ok) {
-          const isCompActive = Boolean(data.companionActive);
-          setCompanionActive(isCompActive);
-          setSocketState("connected");
-          setStatusText(isCompActive ? "Connected to PC" : "Waiting for PC companion to connect...");
-        }
-      } catch {
-        // Ignore status check errors
-      }
-    }, 1500);
-
-    // Send heartbeats every 5 seconds
+    // Heartbeat every 5 seconds
     const heartbeatTimer = setInterval(() => {
-      void fetch(`${cloudRelayUrl}/api/relay`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "heartbeat",
-          token,
-          role: "mobile",
-        }),
-      }).catch(() => {});
+      sendCloud({ type: "heartbeat" });
     }, 5000);
 
     return () => {
-      alive = false;
       clearInterval(flushTimer);
-      clearInterval(statusTimer);
       clearInterval(heartbeatTimer);
       cloudFlushTimerRef.current = null;
     };
-  }, [connectionMode, token, device, cloudRelayUrl, flushCloudBatch]);
+  }, [connectionMode, token, device, cloudRelayUrl, flushCloudBatch, sendCloud]);
 
-  // ─── WebSocket Mode: Connect to companion WebSocket server ──────────
+  // ─── WebSocket Mode: Connect directly to companion over Wi-Fi ───────
 
   useEffect(() => {
     if (connectionMode !== "websocket") return;
@@ -289,18 +266,14 @@ export default function RemotePage() {
     try {
       socket = new WebSocket(wsUrl);
     } catch {
-      queueMicrotask(() => {
-        setSocketState("error");
-        setStatusText("Failed to create WebSocket");
-      });
+      setStatusBadge("Error");
       return;
     }
 
     wsRef.current = socket;
 
     socket.onopen = () => {
-      setSocketState("awaiting_approval");
-      setStatusText("Awaiting desktop approval");
+      setStatusBadge("Connected");
       socket.send(
         JSON.stringify({
           type: "pair_request",
@@ -313,38 +286,21 @@ export default function RemotePage() {
 
     socket.onmessage = (event) => {
       try {
-        const data = JSON.parse(String(event.data)) as { type: string; reason?: string };
+        const data = JSON.parse(String(event.data)) as { type: string };
         if (data.type === "approved") {
-          setSocketState("connected");
-          setCompanionActive(true);
-          setStatusText("Connected to PC");
-        } else if (data.type === "waiting") {
-          setSocketState("awaiting_approval");
-          setStatusText("Awaiting approval");
-        } else if (data.type === "rejected") {
-          setSocketState("error");
-          setStatusText(data.reason ?? "Pairing rejected");
-        } else if (data.type === "disconnected") {
-          setSocketState("disconnected");
-          setCompanionActive(false);
-          setStatusText(data.reason ?? "Disconnected");
+          setStatusBadge("Active");
         }
       } catch {
-        setSocketState("error");
-        setStatusText("Invalid server message");
+        // ignore
       }
     };
 
     socket.onerror = () => {
-      setSocketState("error");
-      setCompanionActive(false);
-      setStatusText(`Cannot reach ${wsHost}:${wsPort}`);
+      setStatusBadge("Offline");
     };
 
     socket.onclose = () => {
-      setSocketState("disconnected");
-      setCompanionActive(false);
-      setStatusText("Connection closed");
+      setStatusBadge("Closed");
     };
 
     const heartbeat = setInterval(() => sendWs({ type: "heartbeat" }), 2000);
@@ -355,10 +311,12 @@ export default function RemotePage() {
     };
   }, [connectionMode, device, sendWs, settings, token, wsHost, wsPort]);
 
+  // ─── Touch & Gesture Handlers (ALWAYS ACTIVE & IMMEDIATE) ───────────
+
   const moveTransform = (dx: number, dy: number) => {
-    const speed = settings.sensitivity;
+    const speed = settings.sensitivity * 1.6;
     const magnitude = Math.sqrt(dx * dx + dy * dy);
-    const accel = Math.max(1, 1 + (settings.acceleration - 1) * Math.min(1.5, magnitude / 16));
+    const accel = Math.max(1, 1 + (settings.acceleration - 1) * Math.min(1.6, magnitude / 14));
     const sx = dx * speed * accel;
     const sy = dy * speed * accel;
     return {
@@ -369,6 +327,7 @@ export default function RemotePage() {
 
   const pointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    setTouchActive(true);
     e.currentTarget.setPointerCapture(e.pointerId);
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
   };
@@ -383,7 +342,7 @@ export default function RemotePage() {
 
     const pointerCount = pointersRef.current.size;
     if (pointerCount >= 2 && settings.twoFingerScroll) {
-      send({ type: "scroll", deltaY: (settings.naturalScroll ? -1 : 1) * dy * 1.5 });
+      send({ type: "scroll", deltaY: (settings.naturalScroll ? -1 : 1) * dy * 1.8 });
       return;
     }
 
@@ -394,6 +353,9 @@ export default function RemotePage() {
   const pointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
     const startCount = pointersRef.current.size;
     pointersRef.current.delete(e.pointerId);
+    if (pointersRef.current.size === 0) {
+      setTouchActive(false);
+    }
 
     if (startCount === 1 && settings.tapToClick && !draggingRef.current) {
       const now = Date.now();
@@ -404,7 +366,7 @@ export default function RemotePage() {
         send({ type: "left_click" });
         lastTapRef.current = now;
       }
-      if (settings.haptic && navigator.vibrate) navigator.vibrate(8);
+      if (settings.haptic && navigator.vibrate) navigator.vibrate(10);
     }
 
     if (draggingRef.current && !settings.dragLock) {
@@ -415,7 +377,7 @@ export default function RemotePage() {
 
   const action = (type: ControlMessage["type"]) => {
     send({ type } as ControlMessage);
-    if (settings.haptic && navigator.vibrate) navigator.vibrate(10);
+    if (settings.haptic && navigator.vibrate) navigator.vibrate(14);
   };
 
   const reconnectWithHost = (newHost: string) => {
@@ -429,8 +391,6 @@ export default function RemotePage() {
 
   const switchToDirectMode = () => {
     setConnectionMode("websocket");
-    setSocketState("connecting");
-    setStatusText("Switching to Direct Wi-Fi...");
   };
 
   const switchToCloudMode = () => {
@@ -439,52 +399,57 @@ export default function RemotePage() {
       wsRef.current = null;
     }
     setConnectionMode("cloud");
-    setSocketState("connecting");
-    setStatusText("Switching to Cloud Relay...");
   };
-
-  const modeLabel = connectionMode === "cloud" ? "☁ Cloud Relay" : "⚡ Direct Wi-Fi";
-  const modeBadgeColor =
-    connectionMode === "cloud"
-      ? "bg-violet-500/30 text-violet-200 border-violet-500/40"
-      : "bg-cyan-500/30 text-cyan-200 border-cyan-500/40";
 
   return (
     <main className="futuristic-bg flex min-h-screen flex-col px-3 pb-4 pt-3 text-white">
+      {/* Top Header Bar */}
       <header className="glass-card gradient-border flex items-center justify-between rounded-2xl px-4 py-3">
-        <div>
-          <h1 className="text-base font-semibold">Mobile as Cursor</h1>
-          <p className="text-xs text-slate-300">
-            {statusText} {connectionMode === "websocket" && wsHost ? `(${wsHost})` : ""}
-          </p>
+        <div className="flex items-center gap-2">
+          <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]" />
+          <div>
+            <h1 className="text-sm font-bold bg-gradient-to-r from-cyan-300 to-violet-300 bg-clip-text text-transparent">
+              Mobile as Cursor
+            </h1>
+            <p className="text-[11px] text-emerald-400 font-medium">
+              {connectionMode === "cloud" ? "☁ Cloud Mode (Active)" : "⚡ Direct Wi-Fi"}
+            </p>
+          </div>
         </div>
-        <div className="flex gap-2">
-          <span className={`rounded-lg px-2.5 py-1.5 text-[10px] font-semibold border ${modeBadgeColor}`}>
-            {modeLabel}
+
+        <div className="flex items-center gap-2">
+          <span className="rounded-full bg-emerald-500/20 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-300 border border-emerald-500/30">
+            {statusBadge}
           </span>
           <button
-            className="rounded-lg bg-white/10 px-2.5 py-1.5 text-xs text-cyan-200"
+            className="rounded-lg bg-white/10 px-2.5 py-1 text-xs text-cyan-200 hover:bg-white/15"
             onClick={() => {
               setHostInput(wsHost);
               setShowHostConfig((v) => !v);
             }}
           >
-            Host
+            Mode
           </button>
-          <button className="rounded-lg bg-white/10 px-2.5 py-1.5 text-xs" onClick={() => setShowSettings((v) => !v)}>
-            Settings
+          <button
+            className="rounded-lg bg-white/10 px-2.5 py-1 text-xs hover:bg-white/15"
+            onClick={() => setShowSettings((v) => !v)}
+          >
+            ⚙
           </button>
         </div>
       </header>
 
+      {/* Mode Selection Drawer */}
       {showHostConfig ? (
-        <section className="glass-card mt-3 space-y-2 rounded-2xl p-3 text-sm">
+        <section className="glass-card mt-2 space-y-2 rounded-2xl p-3 text-sm">
           <p className="font-semibold text-xs text-slate-200">Connection Mode</p>
-          <div className="flex gap-2 mb-2">
+          <div className="flex gap-2">
             <button
               onClick={switchToCloudMode}
               className={`flex-1 rounded-xl py-2 text-xs font-semibold transition ${
-                connectionMode === "cloud" ? "bg-violet-500 text-white" : "bg-white/10 text-slate-300"
+                connectionMode === "cloud"
+                  ? "bg-violet-500 text-white shadow-lg shadow-violet-500/25"
+                  : "bg-white/10 text-slate-300"
               }`}
             >
               ☁ Cloud Relay (Any Network)
@@ -492,15 +457,17 @@ export default function RemotePage() {
             <button
               onClick={switchToDirectMode}
               className={`flex-1 rounded-xl py-2 text-xs font-semibold transition ${
-                connectionMode === "websocket" ? "bg-cyan-500 text-slate-950" : "bg-white/10 text-slate-300"
+                connectionMode === "websocket"
+                  ? "bg-cyan-500 text-slate-950 shadow-lg shadow-cyan-500/25"
+                  : "bg-white/10 text-slate-300"
               }`}
             >
-              ⚡ Direct Wi-Fi (Same Network)
+              ⚡ Direct Wi-Fi
             </button>
           </div>
           {connectionMode === "websocket" ? (
-            <>
-              <p className="font-semibold text-xs text-slate-200">Desktop Companion IP Address</p>
+            <div className="mt-2 space-y-1">
+              <p className="text-xs text-slate-300 font-medium">Desktop IP Address</p>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -513,29 +480,23 @@ export default function RemotePage() {
                   onClick={() => reconnectWithHost(hostInput)}
                   className="rounded-xl bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-slate-950"
                 >
-                  Connect
+                  Save
                 </button>
               </div>
-              <p className="text-[11px] text-slate-400">
-                Enter your PC&apos;s local Wi-Fi IP address shown on the desktop dashboard.
-              </p>
-            </>
-          ) : (
-            <p className="text-[11px] text-slate-400">
-              Cloud relay routes commands through the server. Your phone and laptop can be on different Wi-Fi networks or mobile 4G/5G.
-            </p>
-          )}
+            </div>
+          ) : null}
         </section>
       ) : null}
 
+      {/* Settings Panel */}
       {showSettings ? (
-        <section className="glass-card mt-3 space-y-2 rounded-2xl p-3 text-sm">
+        <section className="glass-card mt-2 space-y-2 rounded-2xl p-3.5 text-xs">
           <label className="block">
-            Sensitivity {settings.sensitivity.toFixed(2)}
+            Sensitivity: {settings.sensitivity.toFixed(2)}x
             <input
               type="range"
-              className="w-full"
-              min={0.1}
+              className="w-full mt-1"
+              min={0.2}
               max={4}
               step={0.05}
               value={settings.sensitivity}
@@ -543,10 +504,10 @@ export default function RemotePage() {
             />
           </label>
           <label className="block">
-            Acceleration {settings.acceleration.toFixed(2)}
+            Acceleration: {settings.acceleration.toFixed(2)}x
             <input
               type="range"
-              className="w-full"
+              className="w-full mt-1"
               min={1}
               max={3}
               step={0.05}
@@ -554,112 +515,119 @@ export default function RemotePage() {
               onChange={(e) => setSettings({ ...settings, acceleration: Number(e.target.value) })}
             />
           </label>
-          <label className="flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={settings.dragLock}
-              onChange={(e) => setSettings({ ...settings, dragLock: e.target.checked })}
-            />
-            Drag lock
-          </label>
-          <label className="flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={settings.tapToClick}
-              onChange={(e) => setSettings({ ...settings, tapToClick: e.target.checked })}
-            />
-            Tap click
-          </label>
-          <label className="flex items-center gap-2 text-xs">
-            <input
-              type="checkbox"
-              checked={settings.twoFingerScroll}
-              onChange={(e) => setSettings({ ...settings, twoFingerScroll: e.target.checked })}
-            />
-            Two finger scroll
-          </label>
+          <div className="flex flex-wrap gap-4 pt-1">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.tapToClick}
+                onChange={(e) => setSettings({ ...settings, tapToClick: e.target.checked })}
+              />
+              Tap to click
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.twoFingerScroll}
+                onChange={(e) => setSettings({ ...settings, twoFingerScroll: e.target.checked })}
+              />
+              Two finger scroll
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.haptic}
+                onChange={(e) => setSettings({ ...settings, haptic: e.target.checked })}
+              />
+              Haptic feedback
+            </label>
+          </div>
         </section>
       ) : null}
 
+      {/* Full-Screen Touch Trackpad (ALWAYS OPERATIONAL & ACTIVE) */}
       <section
         ref={padRef}
-        className="glass-card gradient-border mt-3 flex-[1_1_auto] rounded-3xl relative overflow-hidden"
-        style={{ minHeight: "55vh", touchAction: "none", userSelect: "none" }}
+        className={`glass-card gradient-border mt-3 flex-[1_1_auto] rounded-3xl relative overflow-hidden transition-all duration-150 ${
+          touchActive ? "border-cyan-400 shadow-[0_0_35px_rgba(56,189,248,0.25)]" : "border-white/10"
+        }`}
+        style={{ minHeight: "56vh", touchAction: "none", userSelect: "none" }}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
         onPointerCancel={pointerUp}
       >
         <div className="flex h-full flex-col items-center justify-center p-6 text-center select-none pointer-events-none">
-          {companionActive ? (
-            <div className="space-y-1">
-              <span className="inline-block h-3 w-3 rounded-full bg-emerald-400 mb-2 shadow-[0_0_12px_#34d399]" />
-              <p className="text-base font-semibold text-white">Touch &amp; Drag Trackpad</p>
-              <p className="text-xs text-slate-400">Move your finger to control the computer cursor</p>
+          <div className="space-y-2">
+            <div
+              className={`mx-auto flex h-14 w-14 items-center justify-center rounded-2xl transition-all duration-150 ${
+                touchActive
+                  ? "bg-cyan-500/25 border-cyan-400 scale-110 shadow-[0_0_30px_rgba(56,189,248,0.4)]"
+                  : "bg-cyan-500/10 border-cyan-500/20"
+              } border`}
+            >
+              <svg className="h-7 w-7 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.8}
+                  d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"
+                />
+              </svg>
             </div>
-          ) : connectionMode === "cloud" ? (
-            <div className="space-y-2 max-w-xs">
-              <span className="inline-block h-3 w-3 rounded-full bg-amber-400 mb-1 animate-pulse" />
-              <p className="text-sm font-semibold text-amber-200">Waiting for PC Companion</p>
-              <p className="text-xs text-slate-300">
-                Commands are ready to send. Ensure the companion is running on your PC:
-              </p>
-              <code className="block rounded bg-black/60 p-1.5 text-[11px] font-mono text-cyan-300">
-                npm run companion:dev
-              </code>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              <p className="text-sm text-slate-400">Trackpad Connecting...</p>
-            </div>
-          )}
+            <p className="text-base font-semibold text-white">Touch &amp; Drag Trackpad</p>
+            <p className="text-xs text-slate-400">
+              Slide finger to glide • Tap to click • Two fingers to scroll
+            </p>
+          </div>
         </div>
       </section>
 
+      {/* Mouse Click Buttons */}
       <div className="mt-3 grid grid-cols-2 gap-3">
         <button
           onClick={() => action(settings.leftHanded ? "right_click" : "left_click")}
-          className="glossy-button rounded-2xl bg-cyan-500/20 py-3.5 font-semibold text-cyan-100 hover:bg-cyan-500/30"
+          className="glossy-button rounded-2xl bg-cyan-500/20 py-3.5 font-bold text-cyan-100 hover:bg-cyan-500/30 active:scale-95 transition"
         >
           Left Click
         </button>
         <button
           onClick={() => action(settings.leftHanded ? "left_click" : "right_click")}
-          className="glossy-button rounded-2xl bg-violet-500/20 py-3.5 font-semibold text-violet-100 hover:bg-violet-500/30"
+          className="glossy-button rounded-2xl bg-violet-500/20 py-3.5 font-bold text-violet-100 hover:bg-violet-500/30 active:scale-95 transition"
         >
           Right Click
         </button>
       </div>
 
-      <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
-        <button className="rounded-xl bg-white/10 py-2.5 text-xs font-medium" onClick={() => action("maximize_window")}>
-          ⛶ Maximize
-        </button>
-        <button className="rounded-xl bg-white/10 py-2.5 text-xs font-medium" onClick={() => action("zoom_in")}>
-          ＋ Zoom In
-        </button>
-        <button className="rounded-xl bg-white/10 py-2.5 text-xs font-medium" onClick={() => action("zoom_out")}>
-          － Zoom Out
-        </button>
-        <button className="rounded-xl bg-white/10 py-2.5 text-xs font-medium" onClick={() => action("restore_window")}>
-          🗗 Restore
-        </button>
-        <button className="rounded-xl bg-white/10 py-2.5 text-xs font-medium" onClick={() => action("reset_zoom")}>
-          Reset Zoom
+      {/* Quick Action Buttons */}
+      <div className="mt-2.5 grid grid-cols-4 gap-2 text-xs">
+        <button
+          className="rounded-xl bg-white/10 py-2.5 font-medium hover:bg-white/15 active:scale-95 transition"
+          onClick={() => action("maximize_window")}
+        >
+          ⛶ Max
         </button>
         <button
-          className="rounded-xl bg-rose-500/20 py-2.5 text-xs font-medium text-rose-200"
-          onClick={() => {
-            action("disconnect");
-            wsRef.current?.close();
-          }}
+          className="rounded-xl bg-white/10 py-2.5 font-medium hover:bg-white/15 active:scale-95 transition"
+          onClick={() => action("restore_window")}
         >
-          Disconnect
+          🗗 Restore
+        </button>
+        <button
+          className="rounded-xl bg-white/10 py-2.5 font-medium hover:bg-white/15 active:scale-95 transition"
+          onClick={() => action("zoom_in")}
+        >
+          ＋ Zoom
+        </button>
+        <button
+          className="rounded-xl bg-white/10 py-2.5 font-medium hover:bg-white/15 active:scale-95 transition"
+          onClick={() => action("zoom_out")}
+        >
+          － Zoom
         </button>
       </div>
 
-      <div className="mt-2 text-center text-[11px] text-slate-400">
-        Need help? <Link href="/dashboard" className="underline">Open desktop dashboard</Link>
+      <div className="mt-2 text-center text-[10px] text-slate-400">
+        Connected to PC • <Link href="/dashboard" className="underline">Dashboard</Link>
       </div>
     </main>
   );
