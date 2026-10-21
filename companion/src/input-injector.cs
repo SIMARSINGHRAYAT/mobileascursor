@@ -9,8 +9,8 @@ class Program {
     [DllImport("user32.dll")]
     static extern bool GetCursorPos(out POINT pt);
 
-    [DllImport("user32.dll")]
-    static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
 
     [DllImport("user32.dll")]
     static extern IntPtr GetForegroundWindow();
@@ -21,6 +21,7 @@ class Program {
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X; public int Y; }
 
+    const uint MOUSEEVENTF_MOVE = 0x0001;
     const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     const uint MOUSEEVENTF_LEFTUP = 0x0004;
     const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -39,18 +40,26 @@ class Program {
                 switch (cmd) {
                     case "m": // move dx dy
                         if (parts.Length >= 3) {
-                            int dx = (int)Math.Round(double.Parse(parts[1]));
-                            int dy = (int)Math.Round(double.Parse(parts[2]));
-                            POINT p;
-                            if (GetCursorPos(out p)) {
-                                SetCursorPos(p.X + dx, p.Y + dy);
+                            double dxd = 0, dyd = 0;
+                            if (double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dxd) &&
+                                double.TryParse(parts[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out dyd)) {
+                                int dx = (int)Math.Round(dxd);
+                                int dy = (int)Math.Round(dyd);
+                                POINT p;
+                                bool moved = false;
+                                if (GetCursorPos(out p)) {
+                                    moved = SetCursorPos(p.X + dx, p.Y + dy);
+                                }
+                                if (!moved) {
+                                    mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, UIntPtr.Zero);
+                                }
                             }
                         }
                         break;
                     case "pos": // set absolute pos x y
                         if (parts.Length >= 3) {
-                            int x = int.Parse(parts[1]);
-                            int y = int.Parse(parts[2]);
+                            int x = int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
+                            int y = int.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
                             SetCursorPos(x, y);
                         }
                         break;
@@ -76,8 +85,11 @@ class Program {
                         break;
                     case "s": // scroll
                         if (parts.Length >= 2) {
-                            int delta = (int)Math.Round(double.Parse(parts[1]) * -10);
-                            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (uint)delta, UIntPtr.Zero);
+                            double d = 0;
+                            if (double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out d)) {
+                                int delta = (int)Math.Round(d * -10);
+                                mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, UIntPtr.Zero);
+                            }
                         }
                         break;
                     case "max":

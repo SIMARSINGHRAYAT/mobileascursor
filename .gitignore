@@ -33,6 +33,7 @@ pnpm-debug.log*
 .env*.local
 .env
 .companion_token
+companion_run.log
 
 # vercel
 .vercel

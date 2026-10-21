@@ -93,14 +93,23 @@ let cloudRelay: CloudRelayClient | null = null;
 let cloudRelayConnected = false;
 let cloudMobileDevice: string | null = null;
 
+let moveCount = 0;
+let lastMoveLog = Date.now();
+
 async function executeCommand(cmd: Exclude<SocketInbound, { type: "pair_request" | "heartbeat" | "disconnect" }>): Promise<void> {
-  if (cmd.type !== "mouse_move") {
-    console.log(`[companion] ⚡ Executing: ${cmd.type}`);
+  if (cmd.type === "mouse_move") {
+    moveCount++;
+    const now = Date.now();
+    if (now - lastMoveLog > 1500) {
+      console.log(`[companion] 🖱️ Cursor gliding (dx=${Math.round(cmd.dx)}, dy=${Math.round(cmd.dy)}, batch=${moveCount})`);
+      lastMoveLog = now;
+      moveCount = 0;
+    }
+    await native.move(cmd.dx, cmd.dy);
+    return;
   }
+  console.log(`[companion] ⚡ Executing: ${cmd.type}`);
   switch (cmd.type) {
-    case "mouse_move":
-      await native.move(cmd.dx, cmd.dy);
-      break;
     case "left_click":
       await native.leftClick();
       break;
