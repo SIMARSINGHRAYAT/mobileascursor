@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import type { MqttClient } from "mqtt";
 import { defaultSettings, settingsSchema, type ControlMessage, type ControllerSettings } from "@/lib/control-protocol";
 
 type ConnectionMode = "websocket" | "cloud";
@@ -34,17 +35,25 @@ export default function RemotePage() {
   const lastTapRef = useRef<number>(0);
   const draggingRef = useRef(false);
 
-  // Cloud mode batching
-  const cloudBatchRef = useRef<Array<{ type: string; [key: string]: unknown }>>([]);
-  const cloudFlushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mqttClientRef = useRef<MqttClient | null>(null);
 
-  const [token] = useState<string>(() => {
+  const [token, setToken] = useState<string>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
-      return params.get("token") ?? "";
+      const paramToken = params.get("token");
+      if (paramToken) {
+        const clean = paramToken.trim().toUpperCase();
+        localStorage.setItem("mobile-as-cursor:token", clean);
+        return clean;
+      }
+      const saved = localStorage.getItem("mobile-as-cursor:token");
+      if (saved) return saved.trim().toUpperCase();
     }
     return "";
   });
+
+  const [pairingCodeInput, setPairingCodeInput] = useState<string>("");
+  const [showPairModal, setShowPairModal] = useState<boolean>(false);
 
   const [connectionMode, setConnectionMode] = useState<ConnectionMode>(() => {
     if (typeof window !== "undefined") {
@@ -84,63 +93,27 @@ export default function RemotePage() {
 
   const [hostInput, setHostInput] = useState<string>(wsHost);
   const [touchActive, setTouchActive] = useState(false);
-  const [statusBadge, setStatusBadge] = useState("Connected");
+  const [statusBadge, setStatusBadge] = useState("Connecting...");
 
-  // ─── Dual-Channel Cloud Publishing (Instant Real-Time Stream + Vercel) ──────
-
-  const cloudRelayUrl = typeof window !== "undefined" ? window.location.origin : "";
-
-  const flushCloudBatch = useCallback(async () => {
-    const batch = cloudBatchRef.current;
-    if (batch.length === 0 || !token) return;
-    cloudBatchRef.current = [];
-
-    const payload = JSON.stringify({
-      type: "commands",
-      commands: batch,
-      token,
-      timestamp: Date.now(),
-    });
-
-    // 1. Direct real-time pubsub stream (sub-20ms instant delivery!)
-    try {
-      fetch(`https://ntfy.sh/mac_relay_${token}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: payload,
-        mode: "cors",
-      }).catch(() => {});
-    } catch {
-      // Ignore
-    }
-
-    // 2. Vercel relay route (backup channel)
-    if (cloudRelayUrl) {
-      try {
-        fetch(`${cloudRelayUrl}/api/relay`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "command",
-            token,
-            commands: batch,
-          }),
-        }).catch(() => {});
-      } catch {
-        // Ignore
-      }
-    }
-  }, [cloudRelayUrl, token]);
+  // ─── Real-Time Global Cloud MQTT Publishing (Sub-15ms worldwide) ─────────
 
   const sendCloud = useCallback(
     (msg: { type: string; [key: string]: unknown }) => {
-      cloudBatchRef.current.push(msg);
-      // Instant flush for clicks and actions
-      if (msg.type !== "mouse_move" && msg.type !== "heartbeat") {
-        void flushCloudBatch();
+      const client = mqttClientRef.current;
+      if (client && client.connected && token) {
+        const topic = `mobileascursor/${token.trim().toUpperCase()}`;
+        try {
+          client.publish(
+            topic,
+            JSON.stringify({ ...msg, from: "mobile", token }),
+            { qos: 0 },
+          );
+        } catch {
+          // Ignore transient send errors
+        }
       }
     },
-    [flushCloudBatch],
+    [token],
   );
 
   // ─── Direct WebSocket Mode ──────────────────────────────────────────
@@ -191,62 +164,110 @@ export default function RemotePage() {
     }
   }, [settings]);
 
-  // ─── Cloud Channel Activation & Fast Batch Timer ───────────────────
+  // ─── Cloud MQTT Over WebSocket Activation ─────────────────────────
 
   useEffect(() => {
-    if (connectionMode !== "cloud" || !token) return;
-
-    // Announce mobile join to the cloud relay
-    const announceJoin = () => {
-      const joinPayload = JSON.stringify({
-        type: "mobile_joined",
-        deviceLabel: device,
-        token,
-        timestamp: Date.now(),
-      });
-
-      // Direct pubsub
-      fetch(`https://ntfy.sh/mac_relay_${token}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: joinPayload,
-        mode: "cors",
-      }).catch(() => {});
-
-      // Vercel relay
-      if (cloudRelayUrl) {
-        fetch(`${cloudRelayUrl}/api/relay`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "join",
-            token,
-            deviceLabel: device,
-          }),
-        }).catch(() => {});
+    if (connectionMode !== "cloud" || !token) {
+      if (mqttClientRef.current) {
+        try {
+          mqttClientRef.current.end(true);
+        } catch {}
+        mqttClientRef.current = null;
       }
-    };
+      if (!token) setStatusBadge("Pairing Required");
+      return;
+    }
 
-    announceJoin();
-    setStatusBadge("Live");
+    let isSubscribed = true;
+    let client: MqttClient | null = null;
+    const cleanToken = token.trim().toUpperCase();
+    const topic = `mobileascursor/${cleanToken}`;
 
-    // Ultra-fast 25ms batch flush for smooth mouse cursor gliding
-    const flushTimer = setInterval(() => {
-      void flushCloudBatch();
-    }, 25);
-    cloudFlushTimerRef.current = flushTimer;
+    setStatusBadge("Connecting...");
 
-    // Heartbeat every 5 seconds
+    import("mqtt").then((mqttModule) => {
+      if (!isSubscribed) return;
+      const mqtt = mqttModule.default || mqttModule;
+
+      try {
+        client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt", {
+          keepalive: 30,
+          reconnectPeriod: 2000,
+          connectTimeout: 8000,
+          clean: true,
+        });
+
+        mqttClientRef.current = client;
+
+        client.on("connect", () => {
+          if (!isSubscribed) return;
+          setStatusBadge("Connected");
+
+          // Announce mobile join to the companion
+          client?.publish(
+            topic,
+            JSON.stringify({
+              type: "mobile_joined",
+              deviceLabel: device,
+              from: "mobile",
+              token: cleanToken,
+              timestamp: Date.now(),
+            }),
+            { qos: 0 },
+          );
+
+          // Subscribe to companion replies
+          client?.subscribe(topic, { qos: 0 }, (err: Error | null) => {
+            if (!err) {
+              client?.publish(
+                topic,
+                JSON.stringify({ type: "ping", from: "mobile", timestamp: Date.now() }),
+                { qos: 0 },
+              );
+            }
+          });
+        });
+
+        client.on("message", (_t: string, payload: Buffer | string) => {
+          if (!isSubscribed) return;
+          try {
+            const raw = JSON.parse(payload.toString()) as Record<string, unknown>;
+            if (raw.from === "mobile") return;
+            if (raw.type === "companion_ack" || raw.type === "companion_online" || raw.type === "pong") {
+              setStatusBadge("PC Ready ⚡");
+            }
+          } catch {
+            // Ignore non-json
+          }
+        });
+
+        client.on("error", () => {
+          if (isSubscribed) setStatusBadge("Retrying...");
+        });
+
+        client.on("close", () => {
+          if (isSubscribed) setStatusBadge("Reconnecting...");
+        });
+      } catch (err) {
+        console.warn("MQTT init error:", err);
+      }
+    });
+
     const heartbeatTimer = setInterval(() => {
       sendCloud({ type: "heartbeat" });
-    }, 5000);
+    }, 4000);
 
     return () => {
-      clearInterval(flushTimer);
+      isSubscribed = false;
       clearInterval(heartbeatTimer);
-      cloudFlushTimerRef.current = null;
+      if (client) {
+        try {
+          client.end(true);
+        } catch {}
+      }
+      mqttClientRef.current = null;
     };
-  }, [connectionMode, token, device, cloudRelayUrl, flushCloudBatch, sendCloud]);
+  }, [connectionMode, token, device, sendCloud]);
 
   // ─── WebSocket Mode: Connect directly to companion over Wi-Fi ───────
 
@@ -406,7 +427,15 @@ export default function RemotePage() {
       {/* Top Header Bar */}
       <header className="glass-card gradient-border flex items-center justify-between rounded-2xl px-4 py-3">
         <div className="flex items-center gap-2">
-          <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_10px_#34d399]" />
+          <span
+            className={`h-2.5 w-2.5 rounded-full ${
+              statusBadge.includes("Ready") || statusBadge === "Connected"
+                ? "bg-emerald-400 shadow-[0_0_10px_#34d399] animate-pulse"
+                : statusBadge.includes("Connecting")
+                  ? "bg-amber-400 shadow-[0_0_10px_#fbbf24] animate-ping"
+                  : "bg-rose-400 shadow-[0_0_10px_#f87171]"
+            }`}
+          />
           <div>
             <h1 className="text-sm font-bold bg-gradient-to-r from-cyan-300 to-violet-300 bg-clip-text text-transparent">
               Mobile as Cursor
@@ -417,12 +446,31 @@ export default function RemotePage() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <span className="rounded-full bg-emerald-500/20 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-300 border border-emerald-500/30">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => {
+              setPairingCodeInput(token);
+              setShowPairModal(true);
+            }}
+            className="rounded-lg bg-cyan-500/20 px-2 py-1 text-[11px] font-mono font-semibold text-cyan-300 border border-cyan-400/30 hover:bg-cyan-500/30 transition flex items-center gap-1"
+            title="Change or view pairing code"
+          >
+            <span>🔑</span>
+            <span>{token || "Set Code"}</span>
+          </button>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold border transition ${
+              statusBadge.includes("Ready") || statusBadge === "Connected"
+                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30 shadow-[0_0_10px_rgba(52,211,153,0.3)]"
+                : statusBadge.includes("Connecting")
+                  ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                  : "bg-rose-500/20 text-rose-300 border-rose-500/30"
+            }`}
+          >
             {statusBadge}
           </span>
           <button
-            className="rounded-lg bg-white/10 px-2.5 py-1 text-xs text-cyan-200 hover:bg-white/15"
+            className="rounded-lg bg-white/10 px-2 py-1 text-xs text-cyan-200 hover:bg-white/15"
             onClick={() => {
               setHostInput(wsHost);
               setShowHostConfig((v) => !v);
@@ -431,13 +479,66 @@ export default function RemotePage() {
             Mode
           </button>
           <button
-            className="rounded-lg bg-white/10 px-2.5 py-1 text-xs hover:bg-white/15"
+            className="rounded-lg bg-white/10 px-2 py-1 text-xs hover:bg-white/15"
             onClick={() => setShowSettings((v) => !v)}
           >
             ⚙
           </button>
         </div>
       </header>
+
+      {/* Pairing Code Entry Modal */}
+      {!token || showPairModal ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4">
+          <div className="glass-card gradient-border max-w-sm w-full rounded-3xl p-6 text-center space-y-4 shadow-[0_0_50px_rgba(56,189,248,0.25)]">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 text-2xl">
+              📱
+            </div>
+            <div>
+              <h2 className="text-lg font-bold text-white">Pair with Laptop</h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Enter the 6-character Pairing Code shown on your PC screen or terminal:
+              </p>
+            </div>
+            <input
+              type="text"
+              value={pairingCodeInput}
+              onChange={(e) => setPairingCodeInput(e.target.value.toUpperCase())}
+              placeholder="e.g. 7B9E2K"
+              maxLength={16}
+              autoFocus
+              className="w-full text-center text-2xl font-mono font-bold tracking-widest rounded-2xl bg-black/50 border border-cyan-400/40 p-3 text-cyan-300 placeholder:text-slate-600 focus:outline-none focus:border-cyan-400"
+            />
+            <div className="flex gap-2">
+              {showPairModal && token ? (
+                <button
+                  onClick={() => setShowPairModal(false)}
+                  className="flex-1 rounded-xl bg-white/10 py-3 text-xs font-semibold text-slate-300 hover:bg-white/15"
+                >
+                  Cancel
+                </button>
+              ) : null}
+              <button
+                onClick={() => {
+                  const clean = pairingCodeInput.trim().toUpperCase();
+                  if (clean.length >= 4) {
+                    setToken(clean);
+                    localStorage.setItem("mobile-as-cursor:token", clean);
+                    setShowPairModal(false);
+                  }
+                }}
+                disabled={pairingCodeInput.trim().length < 4}
+                className="flex-1 rounded-xl bg-gradient-to-r from-cyan-500 to-violet-600 py-3 text-xs font-bold text-white shadow-lg shadow-cyan-500/25 disabled:opacity-50"
+              >
+                Connect to PC
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Tip: Open <strong>http://localhost:4850</strong> on your PC to see your code.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       {/* Mode Selection Drawer */}
       {showHostConfig ? (

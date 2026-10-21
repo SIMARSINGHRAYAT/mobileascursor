@@ -33,15 +33,15 @@ export const defaultSettings: ControllerSettings = {
 export const socketInboundSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("pair_request"),
-    token: z.string().min(10).max(256),
+    token: z.string().min(4).max(256),
     deviceLabel: z.string().min(1).max(80),
     settings: settingsSchema.optional(),
   }),
-  z.object({ type: z.literal("mouse_move"), dx: z.number().min(-500).max(500), dy: z.number().min(-500).max(500) }),
+  z.object({ type: z.literal("mouse_move"), dx: z.number().min(-5000).max(5000), dy: z.number().min(-5000).max(5000) }),
   z.object({ type: z.literal("left_click") }),
   z.object({ type: z.literal("right_click") }),
   z.object({ type: z.literal("double_click") }),
-  z.object({ type: z.literal("scroll"), deltaY: z.number().min(-250).max(250) }),
+  z.object({ type: z.literal("scroll"), deltaY: z.number().min(-5000).max(5000) }),
   z.object({ type: z.literal("drag_start") }),
   z.object({ type: z.literal("drag_end") }),
   z.object({ type: z.literal("zoom_in") }),

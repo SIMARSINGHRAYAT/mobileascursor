@@ -52,8 +52,8 @@ export const defaultSettings: ControllerSettings = {
 export const controlMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("mouse_move"),
-    dx: z.number().min(-500).max(500),
-    dy: z.number().min(-500).max(500),
+    dx: z.number().min(-5000).max(5000),
+    dy: z.number().min(-5000).max(5000),
     ts: z.number().optional(),
   }),
   z.object({
@@ -67,7 +67,7 @@ export const controlMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("scroll"),
-    deltaY: z.number().min(-250).max(250),
+    deltaY: z.number().min(-5000).max(5000),
   }),
   z.object({
     type: z.literal("drag_start"),
@@ -103,7 +103,7 @@ export type ControlMessage = z.infer<typeof controlMessageSchema>;
 export const socketInboundSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("pair_request"),
-    token: z.string().min(10).max(256),
+    token: z.string().min(4).max(256),
     deviceLabel: z.string().min(1).max(80),
     settings: settingsSchema.optional(),
   }),

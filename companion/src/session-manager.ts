@@ -1,4 +1,30 @@
+import fs from "node:fs";
+import path from "node:path";
 import { nanoid } from "nanoid";
+
+function getStoredOrNewToken(): string {
+  if (process.env.COMPANION_TOKEN) {
+    return process.env.COMPANION_TOKEN.trim().toUpperCase();
+  }
+  const tokenFile = path.resolve(process.cwd(), ".companion_token");
+  try {
+    if (fs.existsSync(tokenFile)) {
+      const content = fs.readFileSync(tokenFile, "utf-8").trim().toUpperCase();
+      if (content.length >= 4 && content.length <= 32) {
+        return content;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  const generated = nanoid(6).toUpperCase().replace(/[^A-Z0-9]/g, "8");
+  try {
+    fs.writeFileSync(tokenFile, generated, "utf-8");
+  } catch {
+    // ignore
+  }
+  return generated;
+}
 
 export type PairingStatus = "Ready to Pair" | "Awaiting Approval" | "Connected" | "Disconnected" | "Connection Failed";
 
@@ -24,36 +50,41 @@ export class SessionManager {
   private active: ActiveSession | null = null;
   private status: PairingStatus = "Disconnected";
 
-  createToken(ttlMs = 15 * 60_000, customToken?: string): { token: string; expiresAt: number } {
-    const token = customToken && customToken.trim().length > 0 ? customToken.trim() : nanoid(32);
+  createToken(ttlMs = 24 * 60 * 60_000, customToken?: string): { token: string; expiresAt: number } {
+    const defaultToken = getStoredOrNewToken();
+    const token = customToken && customToken.trim().length > 0 ? customToken.trim().toUpperCase() : defaultToken;
     const expiresAt = Date.now() + ttlMs;
     this.pairingToken = { value: token, expiresAt, consumed: false };
     this.pending = null;
     if (!this.active) this.status = "Ready to Pair";
+
+    // Also persist the chosen token
+    try {
+      const tokenFile = path.resolve(process.cwd(), ".companion_token");
+      fs.writeFileSync(tokenFile, token, "utf-8");
+    } catch {
+      // ignore
+    }
+
     return { token, expiresAt };
   }
 
-
-  currentToken(): { value: string; expiresAt: number; consumed: boolean } | null {
-    if (!this.pairingToken) return null;
-    if (Date.now() > this.pairingToken.expiresAt) {
-      this.pairingToken = null;
-      if (!this.active) this.status = "Disconnected";
-      return null;
+  currentToken(): { value: string; expiresAt: number; consumed: boolean } {
+    if (!this.pairingToken || Date.now() > this.pairingToken.expiresAt) {
+      this.createToken();
     }
-    return this.pairingToken;
+    return this.pairingToken!;
   }
 
   receivePairRequest(params: { token: string; deviceLabel: string; socketId: string }): { ok: boolean; reason?: string; request?: PendingRequest } {
-    if (this.active) return { ok: false, reason: "A device is already connected." };
     const token = this.currentToken();
-    if (!token) return { ok: false, reason: "Pairing token expired. Request a fresh QR code." };
-    if (token.consumed) return { ok: false, reason: "Token already used." };
-    if (params.token !== token.value) return { ok: false, reason: "Invalid pairing token." };
+    if (params.token.trim().toUpperCase() !== token.value.toUpperCase()) {
+      return { ok: false, reason: "Invalid pairing token." };
+    }
 
     const request: PendingRequest = {
       requestId: nanoid(12),
-      token: params.token,
+      token: params.token.trim().toUpperCase(),
       deviceLabel: params.deviceLabel,
       requestedAt: Date.now(),
       socketId: params.socketId,
@@ -65,6 +96,9 @@ export class SessionManager {
 
   approve(requestId: string): ActiveSession | null {
     if (!this.pending || this.pending.requestId !== requestId) return null;
+    const token = this.currentToken();
+    token.consumed = true;
+
     this.active = {
       socketId: this.pending.socketId,
       deviceLabel: this.pending.deviceLabel,
@@ -72,11 +106,6 @@ export class SessionManager {
       token: this.pending.token,
       lastHeartbeat: Date.now(),
     };
-
-    if (this.pairingToken) {
-      this.pairingToken.consumed = true;
-    }
-
     this.pending = null;
     this.status = "Connected";
     return this.active;
@@ -84,60 +113,41 @@ export class SessionManager {
 
   reject(requestId: string): PendingRequest | null {
     if (!this.pending || this.pending.requestId !== requestId) return null;
-    const req = this.pending;
+    const rejected = this.pending;
     this.pending = null;
     this.status = "Ready to Pair";
-    return req;
+    return rejected;
   }
 
-  touchHeartbeat(socketId: string): boolean {
-    if (!this.active || this.active.socketId !== socketId) return false;
-    this.active.lastHeartbeat = Date.now();
-    return true;
-  }
-
-  isAuthorizedSocket(socketId: string): boolean {
-    return this.active?.socketId === socketId;
+  touchHeartbeat(socketId: string) {
+    if (this.active && this.active.socketId === socketId) {
+      this.active.lastHeartbeat = Date.now();
+    }
   }
 
   disconnect(socketId?: string): ActiveSession | null {
-    if (!this.active) {
-      this.status = this.pending ? "Awaiting Approval" : "Disconnected";
-      return null;
-    }
+    if (!this.active) return null;
     if (socketId && this.active.socketId !== socketId) return null;
-    const old = this.active;
+    const previous = this.active;
     this.active = null;
-    this.pending = null;
     this.status = "Disconnected";
-    return old;
-  }
-
-  heartbeatTimedOut(timeoutMs = 8_000): boolean {
-    if (!this.active) return false;
-    return Date.now() - this.active.lastHeartbeat > timeoutMs;
+    return previous;
   }
 
   getStatus(): PairingStatus {
-    const token = this.currentToken();
-    if (!token && !this.active && !this.pending) {
-      return this.status === "Connection Failed" ? "Connection Failed" : "Disconnected";
-    }
-    if (this.active) return "Connected";
-    if (this.pending) return "Awaiting Approval";
-    if (token) return "Ready to Pair";
     return this.status;
   }
 
-  setFailure(): void {
-    this.status = "Connection Failed";
+  getActive(): ActiveSession | null {
+    return this.active;
   }
 
   getPending(): PendingRequest | null {
     return this.pending;
   }
 
-  getActive(): ActiveSession | null {
-    return this.active;
+  heartbeatTimedOut(timeoutMs = 15_000): boolean {
+    if (!this.active) return false;
+    return Date.now() - this.active.lastHeartbeat > timeoutMs;
   }
 }

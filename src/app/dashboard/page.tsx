@@ -51,8 +51,18 @@ export default function DashboardPage() {
   });
 
   const [status, setStatus] = useState<CompanionStatus | null>(null);
-  const [localToken, setLocalToken] = useState<string>(() => generateToken());
-  const [localExpiresAt, setLocalExpiresAt] = useState<number>(() => Date.now() + 15 * 60_000);
+  const [localToken, setLocalToken] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("mobile-as-cursor:companion-code");
+      if (saved && saved.length >= 4) return saved.trim().toUpperCase();
+    }
+    return generateToken().substring(0, 6).toUpperCase();
+  });
+  const [codeInput, setCodeInput] = useState<string>(localToken);
+  const [companionMqttActive, setCompanionMqttActive] = useState(false);
+  const [mobileMqttActive, setMobileMqttActive] = useState(false);
+
+  const [localExpiresAt, setLocalExpiresAt] = useState<number>(() => Date.now() + 24 * 60 * 60_000);
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
 
   const [busy, setBusy] = useState<string>("");
@@ -76,6 +86,10 @@ export default function DashboardPage() {
     }
     return "";
   });
+
+  useEffect(() => {
+    setCodeInput(localToken);
+  }, [localToken]);
 
   // Ticking timer for live expiration and connection duration
   useEffect(() => {
@@ -179,6 +193,79 @@ export default function DashboardPage() {
     return () => {
       isSubscribed = false;
       clearInterval(timer);
+    };
+  }, [localToken]);
+
+  // Real-time MQTT channel listener for instant status across different networks
+  useEffect(() => {
+    if (!localToken) return;
+    let isSubscribed = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let client: any = null;
+    const cleanToken = localToken.trim().toUpperCase();
+    const topic = `mobileascursor/${cleanToken}`;
+
+    import("mqtt").then((mqttModule) => {
+      if (!isSubscribed) return;
+      const mqtt = mqttModule.default || mqttModule;
+      try {
+        client = mqtt.connect("wss://broker.hivemq.com:8884/mqtt", {
+          keepalive: 30,
+          reconnectPeriod: 2500,
+          clean: true,
+        });
+
+        client.on("connect", () => {
+          if (!isSubscribed) return;
+          client.subscribe(topic, { qos: 0 });
+          // Ask if companion is already listening
+          client.publish(
+            topic,
+            JSON.stringify({ type: "ping", from: "dashboard", timestamp: Date.now() }),
+            { qos: 0 },
+          );
+        });
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        client.on("message", (_t: string, payload: any) => {
+          if (!isSubscribed) return;
+          try {
+            const raw = JSON.parse(payload.toString()) as Record<string, unknown>;
+            if (raw.from === "dashboard") return;
+            if (
+              raw.from === "companion" ||
+              raw.type === "companion_online" ||
+              raw.type === "companion_ack" ||
+              raw.type === "pong"
+            ) {
+              setCompanionMqttActive(true);
+            }
+            if (
+              raw.from === "mobile" ||
+              raw.type === "mobile_joined" ||
+              raw.type === "mouse_move" ||
+              raw.type === "left_click"
+            ) {
+              setMobileMqttActive(true);
+            }
+          } catch {
+            // Ignore non-json
+          }
+        });
+      } catch {
+        // Ignore init error
+      }
+    });
+
+    return () => {
+      isSubscribed = false;
+      if (client) {
+        try {
+          client.end(true);
+        } catch {
+          // ignore
+        }
+      }
     };
   }, [localToken]);
 
@@ -521,13 +608,31 @@ export default function DashboardPage() {
                   <p className="text-xs text-slate-400">Scan QR to turn your phone into a wireless trackpad</p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className={`status-dot bg-current ${statusColor}`} />
-                  <span className={`text-sm font-medium ${statusColor}`}>
-                    {relayServerMobileActive || status?.status === "Connected"
+                  <span
+                    className={`status-dot bg-current ${
+                      mobileMqttActive || relayServerMobileActive || status?.status === "Connected"
+                        ? "text-emerald-400"
+                        : companionMqttActive || isCompanionConnected
+                          ? "text-cyan-400"
+                          : statusColor
+                    }`}
+                  />
+                  <span
+                    className={`text-sm font-medium ${
+                      mobileMqttActive || relayServerMobileActive || status?.status === "Connected"
+                        ? "text-emerald-400"
+                        : companionMqttActive || isCompanionConnected
+                          ? "text-cyan-400"
+                          : statusColor
+                    }`}
+                  >
+                    {mobileMqttActive || relayServerMobileActive || status?.status === "Connected"
                       ? "Phone Connected"
-                      : isCloudRelayActive
-                        ? "Cloud Relay Ready"
-                        : status?.status ?? "Ready to Pair"}
+                      : companionMqttActive || isCompanionConnected
+                        ? "PC Companion Ready"
+                        : isCloudRelayActive
+                          ? "Cloud Relay Ready"
+                          : status?.status ?? "Ready to Pair"}
                   </span>
                 </div>
               </div>
@@ -562,6 +667,50 @@ export default function DashboardPage() {
                   </span>
                   <span className="text-[10px] font-normal text-slate-400 mt-0.5">Requires same Wi-Fi router</span>
                 </button>
+              </div>
+
+              {/* Pairing Code Sync Bar */}
+              <div className="mb-4 rounded-2xl bg-black/40 border border-cyan-500/25 p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-lg">
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-cyan-400 text-sm">🔑</span>
+                    <span className="text-xs font-semibold text-white">Companion Pairing Code</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Match with code in PC terminal or <a href="http://localhost:4850" target="_blank" rel="noreferrer" className="text-cyan-300 underline font-medium">localhost:4850</a>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={codeInput}
+                    onChange={(e) => setCodeInput(e.target.value.toUpperCase())}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const clean = codeInput.trim().toUpperCase();
+                        if (clean.length >= 4) {
+                          setLocalToken(clean);
+                          localStorage.setItem("mobile-as-cursor:companion-code", clean);
+                        }
+                      }
+                    }}
+                    placeholder="e.g. ABC123"
+                    maxLength={16}
+                    className="w-32 text-center text-sm font-mono font-bold uppercase rounded-xl bg-black/70 border border-cyan-400/40 px-3 py-1.5 text-cyan-300 focus:outline-none focus:border-cyan-400"
+                  />
+                  <button
+                    onClick={() => {
+                      const clean = codeInput.trim().toUpperCase();
+                      if (clean.length >= 4) {
+                        setLocalToken(clean);
+                        localStorage.setItem("mobile-as-cursor:companion-code", clean);
+                      }
+                    }}
+                    className="rounded-xl bg-cyan-500 hover:bg-cyan-400 px-3 py-1.5 text-xs font-bold text-slate-950 transition shadow shadow-cyan-500/25"
+                  >
+                    Update QR
+                  </button>
+                </div>
               </div>
 
               {/* QR Code Canvas */}
@@ -619,6 +768,19 @@ export default function DashboardPage() {
                   >
                     Reset
                   </button>
+                </div>
+
+                {/* Direct Link to Local Companion */}
+                <div className="mt-3 flex flex-wrap justify-center gap-2">
+                  <a
+                    href="http://localhost:4850"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 px-3 py-1.5 text-xs font-semibold text-cyan-200 transition flex items-center gap-1.5"
+                  >
+                    <span>💻</span>
+                    <span>Open Desktop Companion (localhost:4850)</span>
+                  </a>
                 </div>
               </div>
 

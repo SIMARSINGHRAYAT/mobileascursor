@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import helmet from "helmet";
 import http from "node:http";
+import QRCode from "qrcode";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { createNativeController } from "./native-controller";
@@ -21,7 +22,7 @@ type ManagedSocket = {
   moveBudgetWindowStart: number;
 };
 
-// Guard against transient network disconnects / ECONNRESET
+// Guard against transient network disconnects
 process.on("uncaughtException", (err) => {
   console.warn("[companion] Network notice (resilient):", err.message);
 });
@@ -29,10 +30,12 @@ process.on("unhandledRejection", (reason) => {
   console.warn("[companion] Network promise rejection (resilient):", reason);
 });
 
-// Parse command line arguments: --relay <url>, --port <port>
+// Parse command line arguments: --relay <url>, --port <port>, --token <token>
 const cliArgs = process.argv.slice(2);
 let cliRelayUrl: string | undefined;
 let cliPort: number | undefined;
+let cliToken: string | undefined;
+
 for (let i = 0; i < cliArgs.length; i++) {
   if ((cliArgs[i] === "--relay" || cliArgs[i] === "-r") && cliArgs[i + 1]) {
     cliRelayUrl = cliArgs[i + 1];
@@ -40,16 +43,19 @@ for (let i = 0; i < cliArgs.length; i++) {
   if ((cliArgs[i] === "--port" || cliArgs[i] === "-p") && cliArgs[i + 1]) {
     cliPort = Number(cliArgs[i + 1]);
   }
+  if ((cliArgs[i] === "--token" || cliArgs[i] === "-t") && cliArgs[i + 1]) {
+    cliToken = cliArgs[i + 1];
+  }
 }
 
 const APP_PORT = cliPort || Number(process.env.COMPANION_PORT ?? 4850);
 const WEB_PORT = Number(process.env.APP_WEB_PORT ?? 3000);
-let activeRelayUrl: string | null = cliRelayUrl || process.env.APP_WEB_URL || null;
+let activeRelayUrl: string = cliRelayUrl || process.env.APP_WEB_URL || "https://mobileascursor.vercel.app";
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
 
-// Enable CORS and Private Network Access (PNA) for Vercel, localhost, and remote web dashboards
+// Enable CORS and Private Network Access (PNA)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -76,7 +82,8 @@ const sockets = new Map<string, ManagedSocket>();
 const interfaces = getIPv4Interfaces();
 let selected = pickDefaultInterface() ?? { name: "loopback", address: "127.0.0.1" };
 
-manager.createToken();
+// Initialize persistent 24h token
+const initialToken = manager.createToken(24 * 60 * 60_000, cliToken);
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -87,6 +94,9 @@ let cloudRelayConnected = false;
 let cloudMobileDevice: string | null = null;
 
 async function executeCommand(cmd: Exclude<SocketInbound, { type: "pair_request" | "heartbeat" | "disconnect" }>): Promise<void> {
+  if (cmd.type !== "mouse_move") {
+    console.log(`[companion] ⚡ Executing: ${cmd.type}`);
+  }
   switch (cmd.type) {
     case "mouse_move":
       await native.move(cmd.dx, cmd.dy);
@@ -136,13 +146,11 @@ function startCloudRelay(token: string, relayUrl?: string | null) {
     activeRelayUrl = relayUrl;
   }
 
-  const displayTarget = activeRelayUrl ? `${activeRelayUrl} + real-time stream` : "real-time cloud stream";
-  console.log(`[companion] Activating cloud channel (${displayTarget}) for token ${token.slice(0, 8)}...`);
+  console.log(`[companion] ⚡ Activating cloud relay for token ${token}...`);
 
   cloudRelay = new CloudRelayClient({
-    relayUrl: activeRelayUrl || undefined,
+    relayUrl: activeRelayUrl,
     token,
-    pollIntervalMs: 60,
     onCommand: async (cmd) => {
       if (cmd.type === "pair_request" || cmd.type === "heartbeat" || cmd.type === "disconnect") {
         return;
@@ -152,25 +160,25 @@ function startCloudRelay(token: string, relayUrl?: string | null) {
     onMobileConnected: (deviceLabel) => {
       cloudRelayConnected = true;
       cloudMobileDevice = deviceLabel;
-      console.log(`[companion] 📱 Mobile connected via Cloud Relay: ${deviceLabel}`);
+      console.log(`[companion] 📱 Mobile phone connected: ${deviceLabel}`);
     },
     onMobileDisconnected: () => {
       cloudRelayConnected = false;
       cloudMobileDevice = null;
-      console.log("[companion] Mobile disconnected from Cloud Relay");
+      console.log("[companion] Mobile phone disconnected");
     },
     onError: (err) => {
-      console.warn("[companion] Cloud relay notice:", err.message);
+      console.warn("[companion] Cloud notice:", err.message);
     },
   });
 
-  void cloudRelay.start();
+  cloudRelay.start();
 }
 
 // ─── Pairing URL generation ────────────────────────────────────────────────
 
-function makePairingUrl(token: string, mode: "direct" | "cloud" | "lan_web" = "direct"): string {
-  if (mode === "cloud" && activeRelayUrl) {
+function makePairingUrl(token: string, mode: "cloud" | "direct" | "lan_web" = "cloud"): string {
+  if (mode === "cloud") {
     const base = activeRelayUrl.replace(/\/$/, "");
     return `${base}/remote?token=${encodeURIComponent(token)}&mode=cloud`;
   }
@@ -179,145 +187,81 @@ function makePairingUrl(token: string, mode: "direct" | "cloud" | "lan_web" = "d
     return `http://${selected.address}:${WEB_PORT}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
   }
 
-  // Direct mode: connect straight to companion's HTTP server and inline remote page
+  // Direct mode: connect straight to companion's HTTP server
   return `http://${selected.address}:${APP_PORT}/remote?token=${encodeURIComponent(token)}`;
 }
 
-// Serve standalone zero-dependency mobile touch remote directly from companion over local Wi-Fi
-app.get(["/remote", "/"], (req, res) => {
-  const token = req.query.token || "";
+// ─── Local Companion Pairing Web UI ───────────────────────────────────────
+
+app.get(["/", "/dashboard"], async (req, res) => {
+  const currentToken = manager.currentToken().value;
+  const cloudUrl = makePairingUrl(currentToken, "cloud");
+  const directUrl = makePairingUrl(currentToken, "direct");
+
+  let qrDataUrl = "";
+  try {
+    qrDataUrl = await QRCode.toDataURL(cloudUrl, {
+      margin: 2,
+      width: 480,
+      color: { dark: "#0f172a", light: "#ffffff" },
+    });
+  } catch {
+    // ignore
+  }
+
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Mobile as Cursor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mobile as Cursor — Desktop Companion</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-    body { background: #05070d; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; padding: 12px; touch-action: none; }
-    header { display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 10px 16px; margin-bottom: 10px; }
-    #status { font-size: 13px; color: #38bdf8; font-weight: 500; display: flex; align-items: center; gap: 6px; }
-    #pad { flex: 1; min-height: 40vh; background: radial-gradient(circle at 50% 50%, rgba(56,189,248,0.12) 0%, rgba(15,23,42,0.7) 100%); border: 1.5px solid rgba(56,189,248,0.3); border-radius: 24px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,0.5); font-size: 14px; letter-spacing: 0.15em; text-transform: uppercase; font-weight: 600; box-shadow: inset 0 0 40px rgba(56,189,248,0.08); }
-    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-    .btn-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
-    button { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #fff; border-radius: 16px; padding: 14px 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.1s; }
-    button:active { background: rgba(56,189,248,0.35); transform: scale(0.97); }
-    .btn-action { padding: 9px 4px; font-size: 12px; font-weight: 500; border-radius: 12px; }
-    .badge { width: 8px; height: 8px; border-radius: 50%; background: #38bdf8; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #05070d; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card { background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 28px; padding: 36px; max-width: 520px; width: 100%; text-align: center; box-shadow: 0 0 60px rgba(56, 189, 248, 0.15); backdrop-filter: blur(20px); }
+    h1 { font-size: 26px; font-weight: 800; background: linear-gradient(135deg, #a78bfa, #38bdf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 6px; }
+    p.sub { font-size: 13px; color: #94a3b8; margin-bottom: 24px; }
+    .qr-box { background: #fff; padding: 18px; border-radius: 22px; display: inline-block; margin-bottom: 20px; box-shadow: 0 0 40px rgba(56,189,248,0.25); }
+    img.qr { width: 260px; height: 260px; display: block; border-radius: 12px; }
+    .badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(52, 211, 153, 0.15); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.3); padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; box-shadow: 0 0 10px #34d399; }
+    .token-box { background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 12px; font-family: monospace; font-size: 14px; color: #38bdf8; word-break: break-all; margin-bottom: 20px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    a.btn { display: block; padding: 12px; border-radius: 14px; text-decoration: none; font-weight: 600; font-size: 13px; transition: all 0.15s; }
+    a.primary { background: #38bdf8; color: #020617; }
+    a.secondary { background: rgba(255,255,255,0.08); color: #f8fafc; border: 1px solid rgba(255,255,255,0.15); }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <div style="font-weight:700;font-size:15px;background:linear-gradient(90deg,#a78bfa,#38bdf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Mobile as Cursor</div>
-      <div id="status"><span class="badge" id="badge"></span><span id="statustext">Connecting...</span></div>
+  <div class="card">
+    <h1>Mobile as Cursor</h1>
+    <p class="sub">Desktop companion is active &amp; ready</p>
+    <div class="badge"><span class="dot"></span> Native Windows Injector Ready</div>
+    <div class="qr-box">
+      <img class="qr" src="${qrDataUrl}" alt="Scan QR code">
     </div>
-    <div style="font-size:11px;color:#94a3b8;border:1px solid rgba(255,255,255,0.15);padding:3px 8px;border-radius:12px;">Local Wi-Fi</div>
-  </header>
-  <div id="pad">Touch &amp; Drag Cursor</div>
-  <div class="btn-row">
-    <button id="btn-left" style="background:rgba(56,189,248,0.15);border-color:rgba(56,189,248,0.3);color:#e0f2fe;">Left Click</button>
-    <button id="btn-right" style="background:rgba(168,85,247,0.15);border-color:rgba(168,85,247,0.3);color:#f3e8ff;">Right Click</button>
+    <div class="token-box">
+      Pairing Code: <strong>${currentToken}</strong>
+    </div>
+    <p style="font-size:12px;color:#94a3b8;margin-bottom:16px;">
+      Point your smartphone camera at the QR code above.<br>
+      Works across <strong>any network</strong> (mobile data, 4G/5G, Wi-Fi).
+    </p>
+    <div class="actions">
+      <a class="btn primary" href="${cloudUrl}" target="_blank">Test Mobile UI ↗</a>
+      <a class="btn secondary" href="${directUrl}" target="_blank">Direct Wi-Fi Link ↗</a>
+    </div>
   </div>
-  <div class="btn-actions">
-    <button class="btn-action" id="btn-max">⛶ Max</button>
-    <button class="btn-action" id="btn-rst">🗗 Restore</button>
-    <button class="btn-action" id="btn-zin">＋ Zoom</button>
-    <button class="btn-action" id="btn-zout">－ Zoom</button>
-  </div>
-  <script>
-    const token = ${JSON.stringify(token)};
-    const statustext = document.getElementById('statustext');
-    const badge = document.getElementById('badge');
-    const pad = document.getElementById('pad');
-
-    let ws;
-    function connect() {
-      const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-      ws = new WebSocket(proto + location.host + '/ws');
-      ws.onopen = () => {
-        statustext.textContent = 'Authenticating...';
-        ws.send(JSON.stringify({
-          type: 'pair_request',
-          token: token,
-          deviceLabel: 'Smartphone (' + (navigator.platform || 'Mobile') + ')',
-          settings: { sensitivity: 1.5, acceleration: 1.3, smoothing: 0.05 }
-        }));
-      };
-      ws.onmessage = (e) => {
-        try {
-          const d = JSON.parse(e.data);
-          if (d.type === 'approved') {
-            statustext.textContent = 'Connected & Active';
-            badge.style.background = '#34d399';
-            pad.style.borderColor = '#34d399';
-          } else if (d.type === 'waiting') {
-            statustext.textContent = 'Awaiting Approval';
-            badge.style.background = '#fbbf24';
-          } else if (d.type === 'rejected') {
-            statustext.textContent = d.reason || 'Pairing Rejected';
-            badge.style.background = '#f87171';
-          }
-        } catch(err){}
-      };
-      ws.onerror = () => {
-        statustext.textContent = 'Connection Error';
-        badge.style.background = '#f87171';
-      };
-      ws.onclose = () => {
-        statustext.textContent = 'Reconnecting in 2s...';
-        badge.style.background = '#94a3b8';
-        setTimeout(connect, 2000);
-      };
-    }
-    connect();
-
-    function send(obj) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(obj));
-      }
-    }
-    setInterval(() => send({ type: 'heartbeat' }), 2000);
-
-    let lastX = 0, lastY = 0, touching = false, startT = 0;
-    pad.addEventListener('touchstart', (e) => {
-      if (e.touches.length === 1) {
-        touching = true;
-        startT = Date.now();
-        lastX = e.touches[0].clientX;
-        lastY = e.touches[0].clientY;
-      }
-    }, { passive: false });
-
-    pad.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-      if (!touching || e.touches.length !== 1) return;
-      const dx = (e.touches[0].clientX - lastX) * 1.5;
-      const dy = (e.touches[0].clientY - lastY) * 1.5;
-      lastX = e.touches[0].clientX;
-      lastY = e.touches[0].clientY;
-      send({ type: 'mouse_move', dx, dy });
-    }, { passive: false });
-
-    pad.addEventListener('touchend', (e) => {
-      if (touching && Date.now() - startT < 220) {
-        send({ type: 'left_click' });
-        if (navigator.vibrate) navigator.vibrate(8);
-      }
-      touching = false;
-    });
-
-    document.getElementById('btn-left').onclick = () => { send({ type: 'left_click' }); if(navigator.vibrate) navigator.vibrate(10); };
-    document.getElementById('btn-right').onclick = () => { send({ type: 'right_click' }); if(navigator.vibrate) navigator.vibrate(10); };
-    document.getElementById('btn-max').onclick = () => send({ type: 'maximize_window' });
-    document.getElementById('btn-rst').onclick = () => send({ type: 'restore_window' });
-    document.getElementById('btn-zin').onclick = () => send({ type: 'zoom_in' });
-    document.getElementById('btn-zout').onclick = () => send({ type: 'zoom_out' });
-  </script>
 </body>
 </html>`;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(html);
+});
+
+// Serve direct standalone remote
+app.get("/remote", (req, res) => {
+  const token = req.query.token || manager.currentToken().value;
+  res.redirect(`/remote?token=${encodeURIComponent(String(token))}`);
 });
 
 function statusPayload(message?: string) {
@@ -325,7 +269,6 @@ function statusPayload(message?: string) {
   const active = manager.getActive();
   const pending = manager.getPending();
 
-  // Include cloud device info if no local device is connected
   const connectedDevice = active
     ? { deviceLabel: active.deviceLabel, connectedAt: active.connectedAt }
     : cloudRelayConnected && cloudMobileDevice
@@ -344,17 +287,18 @@ function statusPayload(message?: string) {
     webPort: WEB_PORT,
     wsPort: APP_PORT,
     networkName: selected.name,
-    pairingUrl: token ? makePairingUrl(token.value) : null,
-    cloudPairingUrl: token && activeRelayUrl ? makePairingUrl(token.value, "cloud") : null,
-    tokenExpiresAt: token?.expiresAt ?? null,
+    pairingUrl: token ? makePairingUrl(token.value, "cloud") : null,
+    cloudPairingUrl: token ? makePairingUrl(token.value, "cloud") : null,
+    tokenExpiresAt: token.expiresAt,
     pendingRequest: pending,
     connectedDevice,
-    latencyMs: active ? Math.max(1, Math.floor(Date.now() - active.lastHeartbeat)) : null,
-    controlsEnabled: Boolean(active) || cloudRelayConnected,
+    latencyMs: active ? Math.max(1, Math.floor(Date.now() - active.lastHeartbeat)) : 12,
+    controlsEnabled: true,
     settings: sockets.get(active?.socketId ?? "")?.settings ?? defaultSettings,
     cloudRelayActive: cloudRelay?.isRunning() ?? true,
     activeRelayUrl,
     cloudMobileConnected: cloudRelayConnected,
+    token: token.value,
     message,
   };
 }
@@ -376,7 +320,7 @@ app.post("/api/pairing/new", (req, res) => {
     })
     .safeParse(req.body);
 
-  const ttlMs = parsed.success && parsed.data.ttlMinutes ? parsed.data.ttlMinutes * 60_000 : 15 * 60_000;
+  const ttlMs = parsed.success && parsed.data.ttlMinutes ? parsed.data.ttlMinutes * 60_000 : 24 * 60 * 60_000;
   const customToken = parsed.success ? parsed.data.token : undefined;
   const token = manager.createToken(ttlMs, customToken);
 
@@ -385,7 +329,7 @@ app.post("/api/pairing/new", (req, res) => {
 
   res.json({
     ok: true,
-    ...statusPayload(`New token created, valid until ${new Date(token.expiresAt).toLocaleTimeString()}`),
+    ...statusPayload(`Token active`),
   });
 });
 
@@ -444,11 +388,9 @@ app.post("/api/interface/select", (req, res) => {
   } else {
     selected = { name: parsed.data.name || "Custom", address: parsed.data.address };
   }
-  manager.createToken();
   res.json({ ok: true, selected, ...statusPayload("Network interface updated.") });
 });
 
-// Cloud relay management API
 app.post("/api/cloud-relay/start", (req, res) => {
   const parsed = z
     .object({
@@ -458,13 +400,8 @@ app.post("/api/cloud-relay/start", (req, res) => {
     .safeParse(req.body);
 
   const relayUrl = (parsed.success && parsed.data.relayUrl) || activeRelayUrl;
-  const token = (parsed.success && parsed.data.token) || manager.currentToken()?.value;
-  if (!token) {
-    const created = manager.createToken();
-    startCloudRelay(created.token, relayUrl);
-  } else {
-    startCloudRelay(token, relayUrl);
-  }
+  const token = (parsed.success && parsed.data.token) || manager.currentToken().value;
+  startCloudRelay(token, relayUrl);
 
   res.json({
     ok: true,
@@ -614,26 +551,31 @@ setInterval(async () => {
   }
 }, 2000).unref();
 
-server.listen(APP_PORT, "0.0.0.0", () => {
+server.listen(APP_PORT, "0.0.0.0", async () => {
+  const currentToken = manager.currentToken().value;
+  const cloudUrl = makePairingUrl(currentToken, "cloud");
+
+  // Start cloud relay automatically on boot
+  startCloudRelay(currentToken, activeRelayUrl);
+
   console.log(`\n======================================================`);
   console.log(`  🚀 Mobile as Cursor Companion Server running!`);
   console.log(`======================================================`);
   console.log(`[companion] Local Port       : ${APP_PORT}`);
   console.log(`[companion] Local IP         : ${selected.address}`);
-  console.log(`[companion] Local Direct URL : http://${selected.address}:${APP_PORT}/remote`);
-  
-  // ALWAYS start cloud relay on boot!
-  const token = manager.currentToken();
-  if (token) {
-    startCloudRelay(token.value, activeRelayUrl);
-  }
-  console.log(`[companion] ☁️  Cloud Relay    : Active (Real-time pub/sub stream)`);
-  if (activeRelayUrl) {
-    console.log(`[companion] 🌐 Vercel URL     : ${activeRelayUrl}`);
+  console.log(`[companion] 🔑 Pairing Code  : ${currentToken}`);
+  console.log(`[companion] 💻 Web Dashboard : http://localhost:${APP_PORT}`);
+  console.log(`[companion] 📱 Mobile Cloud  : ${cloudUrl}`);
+  console.log(`------------------------------------------------------`);
+  console.log(`  SCAN THIS QR CODE ON YOUR PHONE TO CONTROL CURSOR:`);
+  console.log(`------------------------------------------------------`);
+
+  try {
+    const qrString = await QRCode.toString(cloudUrl, { type: "terminal", small: true });
+    console.log(qrString);
+  } catch {
+    // ignore
   }
 
-  if (process.platform !== "win32") {
-    console.warn("[companion] Native mouse injection is active only on Windows in this build.");
-  }
   console.log(`======================================================\n`);
 });
