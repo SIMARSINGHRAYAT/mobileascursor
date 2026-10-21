@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import helmet from "helmet";
 import http from "node:http";
@@ -7,6 +8,7 @@ import { createNativeController } from "./native-controller";
 import { getIPv4Interfaces, pickDefaultInterface } from "./network";
 import { defaultSettings, settingsSchema, socketInboundSchema, type ControllerSettings, type SocketInbound } from "./protocol";
 import { SessionManager } from "./session-manager";
+import { CloudRelayClient } from "./cloud-relay";
 
 type ManagedSocket = {
   socket: WebSocket;
@@ -19,20 +21,34 @@ type ManagedSocket = {
   moveBudgetWindowStart: number;
 };
 
-const APP_PORT = Number(process.env.COMPANION_PORT ?? 4850);
+// Parse command line arguments: --relay <url>, --port <port>
+const cliArgs = process.argv.slice(2);
+let cliRelayUrl: string | undefined;
+let cliPort: number | undefined;
+for (let i = 0; i < cliArgs.length; i++) {
+  if ((cliArgs[i] === "--relay" || cliArgs[i] === "-r") && cliArgs[i + 1]) {
+    cliRelayUrl = cliArgs[i + 1];
+  }
+  if ((cliArgs[i] === "--port" || cliArgs[i] === "-p") && cliArgs[i + 1]) {
+    cliPort = Number(cliArgs[i + 1]);
+  }
+}
+
+const APP_PORT = cliPort || Number(process.env.COMPANION_PORT ?? 4850);
 const WEB_PORT = Number(process.env.APP_WEB_PORT ?? 3000);
-const APP_WEB_URL = process.env.APP_WEB_URL;
+let activeRelayUrl: string | null = cliRelayUrl || process.env.APP_WEB_URL || null;
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
 
-// Enable CORS for Vercel and remote dashboards
+// Enable CORS and Private Network Access (PNA) for Vercel, localhost, and remote web dashboards
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, *");
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
   if (req.method === "OPTIONS") {
-    res.sendStatus(200);
+    res.sendStatus(204);
     return;
   }
   next();
@@ -57,12 +73,110 @@ manager.createToken();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-function makePairingUrl(token: string): string {
-  if (APP_WEB_URL) {
-    const base = APP_WEB_URL.replace(/\/$/, "");
-    return `${base}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
+// ─── Cloud Relay Integration ──────────────────────────────────────────────
+let cloudRelay: CloudRelayClient | null = null;
+let cloudRelayConnected = false;
+let cloudMobileDevice: string | null = null;
+
+async function executeCommand(cmd: Exclude<SocketInbound, { type: "pair_request" | "heartbeat" | "disconnect" }>): Promise<void> {
+  switch (cmd.type) {
+    case "mouse_move":
+      await native.move(cmd.dx, cmd.dy);
+      break;
+    case "left_click":
+      await native.leftClick();
+      break;
+    case "right_click":
+      await native.rightClick();
+      break;
+    case "double_click":
+      await native.doubleClick();
+      break;
+    case "scroll":
+      await native.scroll(cmd.deltaY);
+      break;
+    case "drag_start":
+      await native.dragStart();
+      break;
+    case "drag_end":
+      await native.dragEnd();
+      break;
+    case "zoom_in":
+      await native.zoomIn();
+      break;
+    case "zoom_out":
+      await native.zoomOut();
+      break;
+    case "reset_zoom":
+      await native.resetZoom();
+      break;
+    case "maximize_window":
+      await native.maximizeWindow();
+      break;
+    case "restore_window":
+      await native.restoreWindow();
+      break;
   }
-  // Default to companion port so it works over pure HTTP on local Wi-Fi without mixed-content issues
+}
+
+function startCloudRelay(relayUrl: string, token: string) {
+  if (cloudRelay) {
+    cloudRelay.stop();
+  }
+
+  activeRelayUrl = relayUrl;
+  console.log(`[companion] Starting cloud relay → ${relayUrl} with token ${token.slice(0, 8)}...`);
+
+  cloudRelay = new CloudRelayClient({
+    relayUrl,
+    token,
+    pollIntervalMs: 60,
+    onCommand: async (cmd) => {
+      if (cmd.type === "pair_request" || cmd.type === "heartbeat" || cmd.type === "disconnect") {
+        return;
+      }
+      await executeCommand(cmd);
+    },
+    onMobileConnected: (deviceLabel) => {
+      cloudRelayConnected = true;
+      cloudMobileDevice = deviceLabel;
+      console.log(`[companion] 📱 Mobile connected via Cloud Relay: ${deviceLabel}`);
+    },
+    onMobileDisconnected: () => {
+      cloudRelayConnected = false;
+      cloudMobileDevice = null;
+      console.log("[companion] Mobile disconnected from Cloud Relay");
+    },
+    onError: (err) => {
+      cloudRelayConnected = false;
+      cloudMobileDevice = null;
+      console.error("[companion] Cloud relay notice:", err.message);
+      // Auto-restart after 5 seconds if we have an active relay url
+      setTimeout(() => {
+        const currentToken = manager.currentToken();
+        if (currentToken && activeRelayUrl) {
+          void startCloudRelay(activeRelayUrl, currentToken.value);
+        }
+      }, 5000);
+    },
+  });
+
+  void cloudRelay.start();
+}
+
+// ─── Pairing URL generation ────────────────────────────────────────────────
+
+function makePairingUrl(token: string, mode: "direct" | "cloud" | "lan_web" = "direct"): string {
+  if (mode === "cloud" && activeRelayUrl) {
+    const base = activeRelayUrl.replace(/\/$/, "");
+    return `${base}/remote?token=${encodeURIComponent(token)}&mode=cloud`;
+  }
+
+  if (mode === "lan_web") {
+    return `http://${selected.address}:${WEB_PORT}/remote?token=${encodeURIComponent(token)}&wsHost=${encodeURIComponent(selected.address)}&wsPort=${APP_PORT}`;
+  }
+
+  // Direct mode: connect straight to companion's HTTP server and inline remote page
   return `http://${selected.address}:${APP_PORT}/remote?token=${encodeURIComponent(token)}`;
 }
 
@@ -203,31 +317,47 @@ app.get(["/remote", "/"], (req, res) => {
   res.send(html);
 });
 
-
-
 function statusPayload(message?: string) {
   const token = manager.currentToken();
   const active = manager.getActive();
   const pending = manager.getPending();
+
+  // Include cloud device info if no local device is connected
+  const connectedDevice = active
+    ? { deviceLabel: active.deviceLabel, connectedAt: active.connectedAt }
+    : cloudRelayConnected && cloudMobileDevice
+      ? { deviceLabel: `${cloudMobileDevice} (Cloud)`, connectedAt: Date.now() }
+      : null;
+
+  const effectiveStatus = active
+    ? manager.getStatus()
+    : cloudRelayConnected
+      ? ("Connected" as const)
+      : manager.getStatus();
+
   return {
-    status: manager.getStatus(),
+    status: effectiveStatus,
     hostIp: selected.address,
     webPort: WEB_PORT,
     wsPort: APP_PORT,
     networkName: selected.name,
     pairingUrl: token ? makePairingUrl(token.value) : null,
+    cloudPairingUrl: token && activeRelayUrl ? makePairingUrl(token.value, "cloud") : null,
     tokenExpiresAt: token?.expiresAt ?? null,
     pendingRequest: pending,
-    connectedDevice: active ? { deviceLabel: active.deviceLabel, connectedAt: active.connectedAt } : null,
+    connectedDevice,
     latencyMs: active ? Math.max(1, Math.floor(Date.now() - active.lastHeartbeat)) : null,
-    controlsEnabled: Boolean(active),
+    controlsEnabled: Boolean(active) || cloudRelayConnected,
     settings: sockets.get(active?.socketId ?? "")?.settings ?? defaultSettings,
+    cloudRelayActive: cloudRelay?.isRunning() ?? false,
+    activeRelayUrl,
+    cloudMobileConnected: cloudRelayConnected,
     message,
   };
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, platform: process.platform });
+  res.json({ ok: true, platform: process.platform, cloudRelayActive: cloudRelay?.isRunning() ?? false });
 });
 
 app.get("/api/status", (_req, res) => {
@@ -235,11 +365,28 @@ app.get("/api/status", (_req, res) => {
 });
 
 app.post("/api/pairing/new", (req, res) => {
-  const parsed = z.object({ token: z.string().optional(), ttlMinutes: z.number().optional() }).safeParse(req.body);
+  const parsed = z
+    .object({
+      token: z.string().optional(),
+      ttlMinutes: z.number().optional(),
+      relayUrl: z.string().optional(),
+    })
+    .safeParse(req.body);
+
   const ttlMs = parsed.success && parsed.data.ttlMinutes ? parsed.data.ttlMinutes * 60_000 : 15 * 60_000;
   const customToken = parsed.success ? parsed.data.token : undefined;
   const token = manager.createToken(ttlMs, customToken);
-  res.json({ ok: true, ...statusPayload(`New token created, valid until ${new Date(token.expiresAt).toLocaleTimeString()}`) });
+
+  const relayUrl = (parsed.success && parsed.data.relayUrl) || activeRelayUrl;
+  if (relayUrl) {
+    activeRelayUrl = relayUrl;
+    startCloudRelay(relayUrl, token.token);
+  }
+
+  res.json({
+    ok: true,
+    ...statusPayload(`New token created, valid until ${new Date(token.expiresAt).toLocaleTimeString()}`),
+  });
 });
 
 app.post("/api/pairing/approve", (req, res) => {
@@ -301,6 +448,47 @@ app.post("/api/interface/select", (req, res) => {
   res.json({ ok: true, selected, ...statusPayload("Network interface updated.") });
 });
 
+// Cloud relay management API
+app.post("/api/cloud-relay/start", (req, res) => {
+  const parsed = z
+    .object({
+      relayUrl: z.string().optional(),
+      token: z.string().optional(),
+    })
+    .safeParse(req.body);
+
+  const relayUrl = (parsed.success && parsed.data.relayUrl) || activeRelayUrl;
+  if (!relayUrl) {
+    return res.status(400).json({
+      ok: false,
+      error: "No relay URL provided. Pass relayUrl or set APP_WEB_URL.",
+    });
+  }
+
+  activeRelayUrl = relayUrl;
+  const token = (parsed.success && parsed.data.token) || manager.currentToken()?.value;
+  if (!token) {
+    const created = manager.createToken();
+    startCloudRelay(relayUrl, created.token);
+  } else {
+    startCloudRelay(relayUrl, token);
+  }
+
+  res.json({
+    ok: true,
+    ...statusPayload(`Cloud relay active for ${relayUrl}`),
+  });
+});
+
+app.post("/api/cloud-relay/stop", (_req, res) => {
+  if (cloudRelay) {
+    cloudRelay.stop();
+    cloudRelay = null;
+    cloudRelayConnected = false;
+    cloudMobileDevice = null;
+  }
+  res.json({ ok: true, ...statusPayload("Cloud relay stopped") });
+});
 
 app.post("/api/settings", (req, res) => {
   const parsed = settingsSchema.safeParse(req.body);
@@ -308,106 +496,86 @@ app.post("/api/settings", (req, res) => {
 
   const active = manager.getActive();
   if (active) {
-    const client = sockets.get(active.socketId);
-    if (client) client.settings = parsed.data;
+    const managed = sockets.get(active.socketId);
+    if (managed) {
+      managed.settings = parsed.data;
+      managed.socket.send(JSON.stringify({ type: "settings_updated", settings: parsed.data }));
+    }
   }
 
-  res.json({ ok: true });
+  res.json({ ok: true, settings: parsed.data });
 });
 
-server.on("upgrade", (req, socket, head) => {
-  if (req.url !== "/ws") {
+server.on("upgrade", (request, socket, head) => {
+  const url = new URL(request.url ?? "", `http://${request.headers.host}`);
+  if (url.pathname !== "/ws") {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws);
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
   });
 });
 
-async function executeCommand(cmd: Exclude<SocketInbound, { type: "pair_request" | "heartbeat" | "disconnect" }>): Promise<void> {
-  switch (cmd.type) {
-    case "mouse_move":
-      await native.move(cmd.dx, cmd.dy);
-      break;
-    case "left_click":
-      await native.leftClick();
-      break;
-    case "right_click":
-      await native.rightClick();
-      break;
-    case "double_click":
-      await native.doubleClick();
-      break;
-    case "scroll":
-      await native.scroll(cmd.deltaY);
-      break;
-    case "drag_start":
-      await native.dragStart();
-      break;
-    case "drag_end":
-      await native.dragEnd();
-      break;
-    case "zoom_in":
-      await native.zoomIn();
-      break;
-    case "zoom_out":
-      await native.zoomOut();
-      break;
-    case "reset_zoom":
-      await native.resetZoom();
-      break;
-    case "maximize_window":
-      await native.maximizeWindow();
-      break;
-    case "restore_window":
-      await native.restoreWindow();
-      break;
-  }
-}
-
-function socketId() {
-  return Math.random().toString(36).slice(2);
-}
-
 wss.on("connection", (socket) => {
-  const id = socketId();
+  const id = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const managed: ManagedSocket = {
     socket,
     id,
     approved: false,
-    settings: defaultSettings,
     lastMessageAt: Date.now(),
     moveBudgetCount: 0,
     moveBudgetWindowStart: Date.now(),
   };
+
   sockets.set(id, managed);
 
-  socket.on("message", async (raw) => {
+  socket.on("message", async (data) => {
     managed.lastMessageAt = Date.now();
-    let parsed: SocketInbound;
+
+    let json: unknown;
     try {
-      parsed = socketInboundSchema.parse(JSON.parse(String(raw)));
+      json = JSON.parse(data.toString());
     } catch {
-      socket.send(JSON.stringify({ type: "rejected", reason: "Invalid command payload" }));
+      return;
+    }
+
+    const parsedCandidate = socketInboundSchema.safeParse(json);
+    if (!parsedCandidate.success) {
+      return;
+    }
+
+    const parsed = parsedCandidate.data;
+
+    if (parsed.type === "heartbeat") {
+      manager.touchHeartbeat(id);
+      socket.send(JSON.stringify({ type: "ack" }));
+      return;
+    }
+
+    if (parsed.type === "disconnect") {
+      const active = manager.disconnect(id);
+      if (active) {
+        await native.releaseAllButtons();
+      }
+      sockets.delete(id);
+      socket.close();
       return;
     }
 
     if (parsed.type === "pair_request") {
-      const result = manager.receivePairRequest({ token: parsed.token, deviceLabel: parsed.deviceLabel, socketId: id });
-      if (!result.ok) {
-        socket.send(JSON.stringify({ type: "rejected", reason: result.reason }));
-        return;
-      }
       managed.deviceLabel = parsed.deviceLabel;
-      managed.settings = parsed.settings ?? defaultSettings;
+      managed.settings = parsed.settings;
 
-      // Automatically approve pairing with valid token for immediate mobile cursor control
-      const active = manager.approve(result.request!.requestId);
-      if (active) {
-        managed.approved = true;
-        socket.send(JSON.stringify({ type: "approved" }));
-        console.log(`[companion] Mobile device paired and active: ${parsed.deviceLabel}`);
+      const result = manager.receivePairRequest({
+        token: parsed.token,
+        deviceLabel: parsed.deviceLabel,
+        socketId: id,
+      });
+
+      if (!result.ok) {
+        socket.send(JSON.stringify({ type: "rejected", reason: result.reason ?? "Rejected" }));
         return;
       }
 
@@ -415,20 +583,7 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    if (parsed.type === "heartbeat") {
-      manager.touchHeartbeat(id);
-      return;
-    }
-
-    if (parsed.type === "disconnect") {
-      manager.disconnect(id);
-      await native.releaseAllButtons();
-      socket.send(JSON.stringify({ type: "disconnected", reason: "Disconnected from mobile." }));
-      return;
-    }
-
-    if (!manager.isAuthorizedSocket(id)) {
-      socket.send(JSON.stringify({ type: "rejected", reason: "Unauthorized session." }));
+    if (!managed.approved) {
       return;
     }
 
@@ -443,7 +598,6 @@ wss.on("connection", (socket) => {
         return;
       }
     }
-
 
     await executeCommand(parsed);
   });
@@ -469,9 +623,30 @@ setInterval(async () => {
 }, 2000).unref();
 
 server.listen(APP_PORT, "0.0.0.0", () => {
-  console.log(`[companion] Mobile as Cursor companion listening on :${APP_PORT}`);
-  console.log(`[companion] Pairing URL base IP ${selected.address}, web port ${WEB_PORT}`);
+  console.log(`\n======================================================`);
+  console.log(`  🚀 Mobile as Cursor Companion Server running!`);
+  console.log(`======================================================`);
+  console.log(`[companion] Local Port       : ${APP_PORT}`);
+  console.log(`[companion] Local IP         : ${selected.address}`);
+  console.log(`[companion] Local Direct URL : http://${selected.address}:${APP_PORT}/remote`);
+  
+  if (activeRelayUrl) {
+    console.log(`[companion] ☁️  Cloud Relay    : ${activeRelayUrl}`);
+    const token = manager.currentToken();
+    if (token) {
+      startCloudRelay(activeRelayUrl, token.value);
+      console.log(`[companion] 📱 Cloud Remote   : ${makePairingUrl(token.value, "cloud")}`);
+    }
+  } else {
+    console.log(`[companion] ☁️  Cloud Relay    : Inactive`);
+    console.log(`[companion]    To enable cross-network mobile control (any Wi-Fi / 4G / 5G):`);
+    console.log(`[companion]    Set APP_WEB_URL=https://your-app.vercel.app in .env or`);
+    console.log(`[companion]    Run with: npm run companion:dev -- --relay https://your-app.vercel.app`);
+    console.log(`[companion]    Or connect it with one click from the web dashboard!`);
+  }
+
   if (process.platform !== "win32") {
     console.warn("[companion] Native mouse injection is active only on Windows in this build.");
   }
+  console.log(`======================================================\n`);
 });

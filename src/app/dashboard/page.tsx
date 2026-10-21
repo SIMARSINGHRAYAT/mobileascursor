@@ -12,6 +12,7 @@ type CompanionStatus = {
   webPort: number;
   wsPort: number;
   pairingUrl: string | null;
+  cloudPairingUrl?: string | null;
   tokenExpiresAt: number | null;
   pendingRequest: { requestId: string; deviceLabel: string; requestedAt: number } | null;
   connectedDevice: { deviceLabel: string; connectedAt: number } | null;
@@ -19,6 +20,9 @@ type CompanionStatus = {
   networkName: string;
   controlsEnabled: boolean;
   settings: ControllerSettings;
+  cloudRelayActive?: boolean;
+  activeRelayUrl?: string | null;
+  cloudMobileConnected?: boolean;
   message?: string;
 };
 
@@ -48,8 +52,6 @@ export default function DashboardPage() {
 
   const [status, setStatus] = useState<CompanionStatus | null>(null);
   const [localToken, setLocalToken] = useState<string>(() => generateToken());
-
-
   const [localExpiresAt, setLocalExpiresAt] = useState<number>(() => Date.now() + 15 * 60_000);
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
 
@@ -57,13 +59,14 @@ export default function DashboardPage() {
   const [now, setNow] = useState<number>(() => Date.now());
 
   const [showConfig, setShowConfig] = useState(false);
-
   const [customUrlInput, setCustomUrlInput] = useState(companionUrl);
-  const [pairingMode, setPairingMode] = useState<"direct" | "cloud" | "lan_web">("direct");
+  const [pairingMode, setPairingMode] = useState<"cloud" | "direct" | "lan_web">("cloud");
   const [copied, setCopied] = useState(false);
+  const [copiedCmd, setCopiedCmd] = useState(false);
 
-
-
+  // Status checked directly from Vercel Cloud Relay API
+  const [relayServerCompanionActive, setRelayServerCompanionActive] = useState(false);
+  const [relayServerMobileActive, setRelayServerMobileActive] = useState(false);
 
   // Network interfaces from companion
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
@@ -122,7 +125,7 @@ export default function DashboardPage() {
             controlsEnabled: false,
             settings: defaultSettings,
             message:
-              "Desktop companion is not running. Start it with: npm run companion:dev (or companion:start).",
+              "Desktop companion is not detected on this machine. Start it with: npm run companion:dev",
           });
         }
       }
@@ -142,6 +145,42 @@ export default function DashboardPage() {
       clearInterval(interval);
     };
   }, [companionUrl]);
+
+  // Also query Vercel Cloud Relay API to verify companion presence independently
+  useEffect(() => {
+    if (!localToken) return;
+    let isSubscribed = true;
+
+    const checkRelay = async () => {
+      try {
+        const res = await fetch(`/api/relay?token=${encodeURIComponent(localToken)}`, {
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          ok: boolean;
+          companionActive?: boolean;
+          mobileActive?: boolean;
+        };
+        if (isSubscribed && data.ok) {
+          setRelayServerCompanionActive(Boolean(data.companionActive));
+          setRelayServerMobileActive(Boolean(data.mobileActive));
+        }
+      } catch {
+        // Ignore fetch errors
+      }
+    };
+
+    void checkRelay();
+    const timer = setInterval(() => {
+      void checkRelay();
+    }, 2500);
+
+    return () => {
+      isSubscribed = false;
+      clearInterval(timer);
+    };
+  }, [localToken]);
 
   // Fetch available network adapters from companion
   useEffect(() => {
@@ -192,20 +231,23 @@ export default function DashboardPage() {
   // Build the fully functional pairing URL
   const effectivePairingUrl = useMemo(() => {
     const origin = typeof window !== "undefined" ? window.location.origin : "";
+
+    if (pairingMode === "cloud" && origin) {
+      // Cloud mode: phone connects to Vercel origin with mode=cloud
+      return `${origin}/remote?token=${encodeURIComponent(localToken)}&mode=cloud`;
+    }
+
     const currentHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
     const hostForUrl = effectiveHost === "127.0.0.1" || effectiveHost === "localhost" ? currentHost : effectiveHost;
 
     if (pairingMode === "direct") {
+      // Direct mode: phone connects straight to companion port
       return `http://${hostForUrl}:${effectivePort}/remote?token=${encodeURIComponent(localToken)}`;
     }
 
-    if (pairingMode === "cloud" && origin) {
-      return `${origin}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
-    }
-
+    // LAN Web mode: phone connects to Next.js dev server on LAN
     return `http://${hostForUrl}:${webPort}/remote?token=${encodeURIComponent(localToken)}&wsHost=${encodeURIComponent(effectiveHost)}&wsPort=${encodeURIComponent(effectivePort)}`;
   }, [effectiveHost, effectivePort, localToken, pairingMode, webPort]);
-
 
   // Generate the QR code data URL whenever the pairing URL changes
   useEffect(() => {
@@ -238,6 +280,37 @@ export default function DashboardPage() {
     };
   }, [effectivePairingUrl]);
 
+  // Activate Cloud Relay on Companion
+  const activateCloudRelay = useCallback(async () => {
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    if (!origin) return;
+
+    setBusy("cloud_relay");
+    try {
+      await fetch(`${companionUrl}/api/cloud-relay/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ relayUrl: origin, token: localToken }),
+      });
+      // refresh status immediately
+      const res = await fetch(`${companionUrl}/api/status`, { cache: "no-store" });
+      const data = (await res.json()) as CompanionStatus;
+      setStatus(data);
+    } catch {
+      // Offline / blocked
+    } finally {
+      setBusy("");
+    }
+  }, [companionUrl, localToken]);
+
+  // Switch mode and automatically start cloud relay if needed
+  const selectPairingMode = (mode: "cloud" | "direct" | "lan_web") => {
+    setPairingMode(mode);
+    if (mode === "cloud") {
+      void activateCloudRelay();
+    }
+  };
+
   // API actions with companion
   const apiAction = async (path: string, payload?: unknown) => {
     setBusy(path);
@@ -266,12 +339,18 @@ export default function DashboardPage() {
     setLocalToken(newToken);
     setLocalExpiresAt(newExpires);
 
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+
     try {
       // If companion is online, register the fresh token
       await fetch(`${companionUrl}/api/pairing/new`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: newToken, ttlMinutes: 15 }),
+        body: JSON.stringify({
+          token: newToken,
+          ttlMinutes: 15,
+          relayUrl: pairingMode === "cloud" ? origin : undefined,
+        }),
       });
     } catch {
       // Companion offline, local token already generated
@@ -295,7 +374,7 @@ export default function DashboardPage() {
     if (!qrDataUrl) return;
     const a = document.createElement("a");
     a.href = qrDataUrl;
-    a.download = `mobile-as-cursor-qr-${effectiveHost}.png`;
+    a.download = `mobile-as-cursor-qr-${pairingMode}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -326,6 +405,19 @@ export default function DashboardPage() {
     setShowConfig(false);
   };
 
+  const originUrl = typeof window !== "undefined" ? window.location.origin : "";
+  const companionCliCommand = `npm run companion:dev -- --relay ${originUrl}`;
+
+  const handleCopyCliCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(companionCliCommand);
+      setCopiedCmd(true);
+      setTimeout(() => setCopiedCmd(false), 2500);
+    } catch {
+      // fallback
+    }
+  };
+
   const connectionDuration = useMemo(() => {
     if (!status?.connectedDevice || !now) return "—";
     const seconds = Math.max(0, Math.floor((now - status.connectedDevice.connectedAt) / 1000));
@@ -334,21 +426,19 @@ export default function DashboardPage() {
     return `${min}m ${String(sec).padStart(2, "0")}s`;
   }, [status, now]);
 
-
   const isCompanionConnected = status && status.status !== "Connection Failed";
+  const isCloudRelayActive = Boolean(status?.cloudRelayActive || relayServerCompanionActive);
 
   const statusColor =
-    status?.status === "Connected"
+    status?.status === "Connected" || relayServerMobileActive
       ? "text-emerald-400"
       : status?.status === "Awaiting Approval"
         ? "text-amber-300"
-        : status?.status === "Ready to Pair"
+        : status?.status === "Ready to Pair" || isCloudRelayActive
           ? "text-cyan-300"
           : status?.status === "Connection Failed"
             ? "text-rose-400"
             : "text-sky-300";
-
-  const isHttps = typeof window !== "undefined" && window.location.protocol === "https:";
 
   return (
     <main className="futuristic-bg min-h-screen px-4 py-6 sm:px-7">
@@ -368,10 +458,12 @@ export default function DashboardPage() {
                 className={`rounded-full px-3 py-1.5 text-xs transition ${
                   isCompanionConnected
                     ? "bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 border border-emerald-500/30"
-                    : "bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 border border-amber-500/30"
+                    : isCloudRelayActive
+                      ? "bg-violet-500/20 text-violet-200 hover:bg-violet-500/30 border border-violet-500/30"
+                      : "bg-amber-500/20 text-amber-200 hover:bg-amber-500/30 border border-amber-500/30"
                 }`}
               >
-                Companion: {companionUrl.replace(/^https?:\/\//, "")} {isCompanionConnected ? "● Live" : "○ Offline"}
+                Companion: {isCompanionConnected ? "● Live (Local)" : isCloudRelayActive ? "☁ Live (Relay)" : "○ Offline"}
               </button>
               <Link href="/dashboard" className="rounded-full bg-white/10 px-3 py-1.5 hover:bg-white/20">
                 Dashboard
@@ -388,7 +480,7 @@ export default function DashboardPage() {
           <div className="glass-card gradient-border rounded-2xl p-4 text-sm text-slate-200">
             <h3 className="font-semibold text-white">Configure Desktop Companion Address</h3>
             <p className="mt-1 text-xs text-slate-400">
-              When deployed to Vercel, the dashboard runs in your browser and talks to the companion on your local computer.
+              The dashboard talks to the companion server running on your computer (default: <code>http://127.0.0.1:4850</code>).
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
               <input
@@ -417,18 +509,6 @@ export default function DashboardPage() {
           </div>
         ) : null}
 
-        {/* HTTPS Mixed Content Tip */}
-        {isHttps && companionUrl.startsWith("http://") && !isCompanionConnected ? (
-          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200">
-            <strong>HTTPS Notice:</strong> The dashboard is running securely on HTTPS. If your browser blocks connecting to <code>{companionUrl}</code>:
-            <ul className="mt-1 list-disc pl-5 space-y-0.5">
-              <li>You can still scan the QR code below on your phone to connect directly!</li>
-              <li>Or click the lock/settings icon in your browser address bar and allow <em>Insecure content / Local network access</em>.</li>
-              <li>Or run companion through a tunnel (e.g. Cloudflare Tunnel or ngrok) and set its HTTPS address above.</li>
-            </ul>
-          </div>
-        ) : null}
-
         {/* Main Grid: QR Code Studio & Status Sidebar */}
         <section className="grid gap-6 lg:grid-cols-[1.15fr,0.85fr]">
           {/* QR Code Presentation Box */}
@@ -438,14 +518,50 @@ export default function DashboardPage() {
               <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-xl font-semibold text-white">Pair with Smartphone</h2>
-                  <p className="text-xs text-slate-400">Scan QR to connect phone trackpad to PC</p>
+                  <p className="text-xs text-slate-400">Scan QR to turn your phone into a wireless trackpad</p>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className={`status-dot bg-current ${statusColor}`} />
                   <span className={`text-sm font-medium ${statusColor}`}>
-                    {status?.status ?? "Ready to Pair"}
+                    {relayServerMobileActive || status?.status === "Connected"
+                      ? "Phone Connected"
+                      : isCloudRelayActive
+                        ? "Cloud Relay Ready"
+                        : status?.status ?? "Ready to Pair"}
                   </span>
                 </div>
+              </div>
+
+              {/* Mode Switcher Tabs */}
+              <div className="mb-4 grid grid-cols-2 gap-2 rounded-2xl bg-black/40 p-1.5 border border-white/10">
+                <button
+                  onClick={() => selectPairingMode("cloud")}
+                  className={`flex flex-col items-center justify-center rounded-xl py-2 px-3 text-xs font-semibold transition ${
+                    pairingMode === "cloud"
+                      ? "bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-500/25"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span>☁️ Cloud Mode</span>
+                    <span className="rounded bg-violet-400/20 px-1 py-0.2 text-[10px] text-violet-200">Recommended</span>
+                  </span>
+                  <span className="text-[10px] font-normal text-slate-300 mt-0.5">Works on any network (4G, 5G, Wi-Fi)</span>
+                </button>
+
+                <button
+                  onClick={() => selectPairingMode("direct")}
+                  className={`flex flex-col items-center justify-center rounded-xl py-2 px-3 text-xs font-semibold transition ${
+                    pairingMode === "direct"
+                      ? "bg-cyan-500 text-slate-950 shadow-lg shadow-cyan-500/25"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <span>⚡ Direct Wi-Fi</span>
+                  </span>
+                  <span className="text-[10px] font-normal text-slate-400 mt-0.5">Requires same Wi-Fi router</span>
+                </button>
               </div>
 
               {/* QR Code Canvas */}
@@ -462,7 +578,7 @@ export default function DashboardPage() {
                     <div className="grid h-64 w-64 sm:h-72 sm:w-72 place-items-center rounded-xl bg-slate-900 text-slate-400 text-sm">
                       <div className="flex flex-col items-center gap-2">
                         <span className="animate-spin h-6 w-6 border-2 border-cyan-400 border-t-transparent rounded-full" />
-                        <span>Rendering QR Code...</span>
+                        <span>Generating QR Code...</span>
                       </div>
                     </div>
                   )}
@@ -506,64 +622,88 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              {/* Mode & Interface Controls */}
+              {/* Mode Details & Companion Connection Card */}
               <div className="mt-4 space-y-3 rounded-2xl bg-white/5 p-3.5 text-xs text-slate-200">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-slate-300 font-medium">QR Connection Mode:</span>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <button
-                      onClick={() => setPairingMode("direct")}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                        pairingMode === "direct" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
-                      }`}
-                      title="Direct connection to companion port 4850 over local Wi-Fi without SSL mixed-content restrictions"
-                    >
-                      ⚡ Direct Wi-Fi (Best)
-                    </button>
-                    <button
-                      onClick={() => setPairingMode("cloud")}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                        pairingMode === "cloud" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
-                      }`}
-                    >
-                      Cloud ({typeof window !== "undefined" ? window.location.host : "Vercel"})
-                    </button>
-                    <button
-                      onClick={() => setPairingMode("lan_web")}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition ${
-                        pairingMode === "lan_web" ? "bg-cyan-500 text-slate-950 font-semibold" : "bg-white/10 text-slate-300 hover:bg-white/15"
-                      }`}
-                    >
-                      LAN Web (:3000)
-                    </button>
-                  </div>
-                </div>
+                {pairingMode === "cloud" ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-violet-300 flex items-center gap-1.5">
+                        <span>☁️ Cloud Relay Active</span>
+                      </span>
+                      {isCloudRelayActive ? (
+                        <span className="flex items-center gap-1 rounded-full bg-emerald-500/20 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300 border border-emerald-500/30">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
+                          Companion Polling Live
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-amber-500/20 px-2.5 py-0.5 text-[11px] text-amber-300 border border-amber-500/30">
+                          Waiting for Companion
+                        </span>
+                      )}
+                    </div>
 
+                    <p className="text-slate-300 text-[11px]">
+                      Your phone sends movements to this Vercel relay; the companion app on your PC executes them. Both can be on <strong>different networks</strong> (mobile data, 4G/5G, work Wi-Fi, etc.).
+                    </p>
 
-                {/* Network Interface Dropdown */}
-                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10">
-                  <label htmlFor="interface-select" className="text-slate-300 font-medium">
-                    PC Network IP:
-                  </label>
-                  <div className="flex flex-1 max-w-xs items-center gap-2">
-                    <select
-                      id="interface-select"
-                      value={selectedHost}
-                      onChange={(e) => handleSelectInterface(e.target.value)}
-                      className="w-full rounded-lg bg-black/60 px-2.5 py-1 text-xs text-white border border-white/20 outline-none focus:border-cyan-400"
-                    >
-                      {status?.hostIp && status.hostIp !== "Unavailable" ? (
-                        <option value={status.hostIp}>Default: {status.hostIp} ({status.networkName || "Auto"})</option>
-                      ) : null}
-                      {interfaces.map((iface) => (
-                        <option key={iface.address} value={iface.address}>
-                          {iface.name}: {iface.address}
-                        </option>
-                      ))}
-                      <option value="127.0.0.1">Loopback: 127.0.0.1</option>
-                    </select>
+                    {!isCloudRelayActive ? (
+                      <div className="rounded-xl border border-violet-500/30 bg-violet-500/10 p-3 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-violet-200 font-medium">To connect your PC companion:</p>
+                          {isCompanionConnected ? (
+                            <button
+                              onClick={activateCloudRelay}
+                              disabled={busy === "cloud_relay"}
+                              className="rounded-lg bg-violet-500 px-3 py-1 font-semibold text-white hover:bg-violet-400 text-xs shadow"
+                            >
+                              {busy === "cloud_relay" ? "Connecting..." : "⚡ Activate Relay Now"}
+                            </button>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center justify-between gap-2 bg-black/40 rounded-lg p-2 border border-white/10">
+                          <code className="text-cyan-300 text-[11px] font-mono select-all truncate">
+                            {companionCliCommand}
+                          </code>
+                          <button
+                            onClick={handleCopyCliCommand}
+                            className="shrink-0 text-xs text-slate-300 hover:text-white bg-white/10 px-2 py-0.5 rounded"
+                          >
+                            {copiedCmd ? "Copied! ✓" : "Copy"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-                </div>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-slate-300 text-[11px]">
+                      ⚡ Direct Wi-Fi connects phone directly to <code>http://{effectiveHost}:{effectivePort}</code>. Both devices must be on the <strong>same Wi-Fi router</strong>.
+                    </p>
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-white/10">
+                      <label htmlFor="interface-select" className="text-slate-300 font-medium">
+                        PC Local IP:
+                      </label>
+                      <div className="flex flex-1 max-w-xs items-center gap-2">
+                        <select
+                          id="interface-select"
+                          value={selectedHost}
+                          onChange={(e) => handleSelectInterface(e.target.value)}
+                          className="w-full rounded-lg bg-black/60 px-2.5 py-1 text-xs text-white border border-white/20 outline-none focus:border-cyan-400"
+                        >
+                          {status?.hostIp && status.hostIp !== "Unavailable" ? (
+                            <option value={status.hostIp}>Default: {status.hostIp} ({status.networkName || "Auto"})</option>
+                          ) : null}
+                          {interfaces.map((iface) => (
+                            <option key={iface.address} value={iface.address}>
+                              {iface.name}: {iface.address}
+                            </option>
+                          ))}
+                          <option value="127.0.0.1">Loopback: 127.0.0.1</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Encoded URL Inspector Pill */}
                 <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
@@ -576,7 +716,7 @@ export default function DashboardPage() {
                     rel="noreferrer"
                     className="shrink-0 text-cyan-300 hover:text-cyan-200 underline text-[11px]"
                   >
-                    Open test ↗
+                    Open remote ↗
                   </a>
                 </div>
               </div>
@@ -620,33 +760,43 @@ export default function DashboardPage() {
               <dl className="mt-4 space-y-3 text-sm text-slate-200">
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
                   <dt className="text-slate-400">Desktop Companion</dt>
-                  <dd className={isCompanionConnected ? "text-emerald-400 font-medium" : "text-amber-400"}>
-                    {isCompanionConnected ? "Running & Ready" : "Offline / Unreachable"}
+                  <dd className={isCompanionConnected || isCloudRelayActive ? "text-emerald-400 font-medium" : "text-amber-400"}>
+                    {isCompanionConnected
+                      ? "Running Locally"
+                      : isCloudRelayActive
+                        ? "Active via Cloud Relay"
+                        : "Offline / Unreachable"}
                   </dd>
                 </div>
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
-                  <dt className="text-slate-400">QR Target Host</dt>
-                  <dd className="font-mono text-cyan-300">{effectiveHost}</dd>
+                  <dt className="text-slate-400">Cloud Relay</dt>
+                  <dd className={isCloudRelayActive ? "text-violet-300 font-medium" : "text-slate-500"}>
+                    {isCloudRelayActive ? "Polling Live ☁" : "Inactive"}
+                  </dd>
                 </div>
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
-                  <dt className="text-slate-400">WebSocket Port</dt>
-                  <dd className="font-mono">{effectivePort}</dd>
+                  <dt className="text-slate-400">Pairing Mode</dt>
+                  <dd className="font-semibold text-cyan-300">
+                    {pairingMode === "cloud" ? "Cloud (Cross-Network)" : "Direct Local Wi-Fi"}
+                  </dd>
                 </div>
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
-                  <dt className="text-slate-400">Connected Device</dt>
-                  <dd className="font-medium text-white">{status?.connectedDevice?.deviceLabel ?? "None"}</dd>
+                  <dt className="text-slate-400">Connected Phone</dt>
+                  <dd className="font-medium text-white">
+                    {status?.connectedDevice?.deviceLabel ?? (relayServerMobileActive ? "Mobile Phone (Cloud)" : "None")}
+                  </dd>
                 </div>
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
                   <dt className="text-slate-400">Session Duration</dt>
                   <dd>{connectionDuration}</dd>
                 </div>
                 <div className="flex justify-between gap-3 border-b border-white/5 pb-2">
-                  <dt className="text-slate-400">Approx Latency</dt>
-                  <dd>{status?.latencyMs ? `${status.latencyMs} ms` : "—"}</dd>
+                  <dt className="text-slate-400">Latency</dt>
+                  <dd>{pairingMode === "cloud" ? "~40-80 ms (Cloud)" : status?.latencyMs ? `${status.latencyMs} ms` : "—"}</dd>
                 </div>
               </dl>
 
-              {/* Pending Mobile Pairing Request Card */}
+              {/* Pending Mobile Pairing Request Card (Direct Mode) */}
               {status?.pendingRequest ? (
                 <div className="mt-5 rounded-2xl border border-amber-400/40 bg-amber-400/15 p-4 text-sm text-amber-100 animate-pulse">
                   <p className="font-semibold text-base">Incoming Mobile Request!</p>
@@ -677,13 +827,21 @@ export default function DashboardPage() {
             </div>
 
             {/* Quick Flow Instructions */}
-            <div className="mt-6 rounded-2xl bg-white/5 p-4 text-xs text-slate-300">
-              <p className="font-semibold text-white mb-2">How to connect:</p>
-              <ol className="list-decimal pl-4 space-y-1 text-slate-400">
-                <li>Make sure phone and computer are on the same Wi-Fi.</li>
-                <li>Point your phone camera at the QR code and tap the link.</li>
-                <li>Tap <strong>Approve</strong> when prompted here on desktop.</li>
-                <li>Use your phone screen to glide the mouse pointer!</li>
+            <div className="mt-6 rounded-2xl bg-white/5 p-4 text-xs text-slate-300 space-y-2">
+              <p className="font-semibold text-white">How it works:</p>
+              <ol className="list-decimal pl-4 space-y-1.5 text-slate-400 text-[11px]">
+                <li>
+                  <strong className="text-white">Cloud Mode:</strong> Works anywhere. Your phone and laptop can be on <strong>completely different networks</strong> (mobile data, different Wi-Fi).
+                </li>
+                <li>
+                  <strong className="text-white">Start Companion:</strong> On your PC, run <code className="bg-black/30 px-1 rounded text-cyan-300">npm run companion:dev</code>.
+                </li>
+                <li>
+                  <strong className="text-white">Scan QR:</strong> Point your smartphone camera at the QR code and tap the link to open the trackpad.
+                </li>
+                <li>
+                  <strong className="text-white">Direct Wi-Fi:</strong> If both devices share the same Wi-Fi router, switch to Direct Wi-Fi for ultra-low latency.
+                </li>
               </ol>
             </div>
           </aside>

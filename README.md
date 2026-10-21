@@ -1,158 +1,140 @@
 # Mobile as Cursor
 
-Mobile as Cursor turns a smartphone browser into a wireless touchpad for a Windows PC.
+> Turn your smartphone into a wireless mouse — control your computer with just a touch.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/your-username/mobileascursor)
+## Features
 
----
+- 📱 **Touch Trackpad** — Use your phone screen as a cursor controller
+- ⚡ **Direct Wi-Fi Mode** — Low-latency local connection (same network)
+- ☁️ **Cloud Relay Mode** — Works across **any network** (mobile data, different Wi-Fi)
+- 🖱️ **Full Mouse Control** — Move, left/right click, double click, drag, scroll
+- 🔍 **Window Controls** — Maximize, restore, zoom in/out
+- 🔐 **Token-based Pairing** — Secure QR code authentication with expiry
+- 🎨 **Premium UI** — Glassmorphism design with smooth animations
+- 🚀 **Vercel Ready** — Deploy the web app to Vercel, run companion locally
 
-## What is included
-
-- **Premium Next.js Web UI (Vercel Ready)**
-  - Futuristic dark welcome page (`/`)
-  - Desktop dashboard with live pairing status, dynamic QR code generation, and companion host config (`/dashboard`)
-  - Settings panel with customizable sensitivity, acceleration, and touch controls (`/settings`)
-  - Mobile remote touchpad with relative touch tracking, gestures, and quick reconnection tools (`/remote`)
-- **Local desktop companion** (`companion/`)
-  - Local HTTP API + WebSocket server
-  - CORS enabled for cross-origin dashboard connections
-  - QR token pairing lifecycle with approval/reject flow
-  - One authorized controller at a time
-  - Heartbeat timeout and forced button release on disconnect
-  - Windows-native input injection (mouse, click, scroll, maximize, restore, zoom shortcuts) via PowerShell + User32
-
----
-
-## Deploy to Vercel
-
-The Next.js web application is 100% Vercel ready.
-
-### Option 1: Deploy with Git (Recommended)
-1. Push your repository to GitHub, GitLab, or Bitbucket.
-2. Go to [Vercel](https://vercel.com/) and click **Add New Project**.
-3. Select your repository.
-4. Framework Preset will be automatically detected as **Next.js**.
-5. Build and Output Settings:
-   - **Build Command:** `next build` (or leave default)
-   - **Output Directory:** `.next` (default)
-   - **Install Command:** `npm install` (default)
-6. Click **Deploy**.
-
-### Option 2: Deploy with Vercel CLI
-```bash
-npm i -g vercel
-vercel
-```
-
-### Environment Variables on Vercel
-All environment variables are optional:
-- `NEXT_PUBLIC_COMPANION_URL`: (Optional) Custom companion URL. Defaults to `http://127.0.0.1:4850`.
-- `DATABASE_URL`: (Optional) PostgreSQL connection string if you connect a database. If omitted, the app runs gracefully without database requirements.
-
----
-
-## How It Works with Vercel
+## Architecture
 
 ```
-  +-----------------------------------------------------------+
-  |                   VERCEL GLOBAL CDN                       |
-  |  Hosts the Next.js Web UI (/dashboard, /remote, /settings)|
-  +-----------------------------------------------------------+
-               ^                                   ^
-               | 1. Opens dashboard                | 3. Scans QR to load
-               |    in browser                     |    /remote on mobile
-               v                                   v
-  +-------------------------+             +-------------------+
-  |   Desktop PC (Windows)  |             |  Mobile Phone     |
-  | Runs Companion Daemon   |<~~~~~~~~~~~>| Controls Trackpad |
-  | (HTTP: 4850 / WS: 4850) |  WebSocket  | over local Wi-Fi  |
-  +-------------------------+             +-------------------+
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   Mobile     │────▶│  Vercel Cloud    │────▶│   Companion     │
+│   Phone      │     │  (Relay API)     │     │   (Your PC)     │
+│              │     │                  │     │                 │
+│  Touch pad   │     │  /api/relay      │     │  Mouse inject   │
+│  Buttons     │     │  (message broker)│     │  input-injector  │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+       │                                            │
+       │         Direct Wi-Fi (Same Network)        │
+       └────────────────────────────────────────────┘
 ```
 
-1. **Dashboard**: You open `https://your-app.vercel.app/dashboard` on your Windows PC. The dashboard connects to your local desktop companion daemon running on `http://127.0.0.1:4850`.
-2. **Pairing QR**: The dashboard generates a QR code containing your pairing token and your PC's local network IP.
-3. **Remote Control**: Scan the QR code on your smartphone. The phone loads the UI from Vercel and connects directly to your desktop companion over Wi-Fi (`ws://<PC-LAN-IP>:4850/ws`).
-4. **Approve & Control**: Click **Approve** on your desktop, and use your phone as a trackpad!
+### Two Connection Modes
 
----
+| Mode | Network Requirement | Latency | How It Works |
+|------|-------------------|---------|-------------|
+| **⚡ Direct Wi-Fi** | Same Wi-Fi network | ~5ms | Phone → WebSocket → Companion |
+| **☁️ Cloud Relay** | Any network | ~80-150ms | Phone → HTTP POST → Vercel API → Companion polls |
 
-## Local Development
+## Quick Start
 
 ### 1. Install Dependencies
+
 ```bash
 npm install
 ```
 
-### 2. Run the Next.js UI
+### 2. Run the Companion (on your PC)
+
+```bash
+# For direct Wi-Fi mode only:
+npm run companion:dev
+
+# For cloud relay mode (cross-network), set your Vercel URL first:
+# Create a .env file with: APP_WEB_URL=https://your-app.vercel.app
+npm run companion:dev
+```
+
+### 3. Run the Web Dashboard
+
 ```bash
 npm run dev
 ```
 
-### 3. Run the Companion Daemon (in another terminal)
+### 4. Scan the QR Code
+
+- Open `http://localhost:3000/dashboard` on your PC
+- Choose **Direct Wi-Fi** or **Cloud** mode
+- Scan the QR code with your phone
+- Start controlling your cursor!
+
+## Deploy to Vercel
+
+### Web App (Vercel)
+
+1. Push to GitHub
+2. Import to Vercel
+3. Deploy — no environment variables needed for the web app
+
+### Companion (Your PC)
+
+The companion must run on the PC you want to control. Create a `.env` file:
+
+```env
+# Required for cloud relay (cross-network support)
+APP_WEB_URL=https://your-project.vercel.app
+
+# Optional: custom ports
+COMPANION_PORT=4850
+```
+
+Then run:
+
 ```bash
 npm run companion:dev
 ```
 
-By default:
-- Next.js Web UI: `http://localhost:3000`
-- Companion API + WS: `http://localhost:4850` and `ws://<LAN-IP>:4850/ws`
+## Environment Variables
 
----
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `NEXT_PUBLIC_COMPANION_URL` | No | `http://127.0.0.1:4850` | Companion server URL for dashboard |
+| `APP_WEB_URL` | No | — | Your Vercel deployment URL (enables cloud relay) |
+| `COMPANION_PORT` | No | `4850` | Companion server port |
+| `APP_WEB_PORT` | No | `3000` | Next.js dev server port |
+| `DATABASE_URL` | No | — | PostgreSQL connection (optional) |
 
-## Production Build & Packaging
+## Tech Stack
 
-### Build Next.js App
-```bash
-npm run build
+- **Frontend**: Next.js 16, React 19, TailwindCSS 4
+- **Companion**: Express, WebSocket (ws), native input injection
+- **Cloud Relay**: Vercel Serverless Functions (in-memory message broker)
+- **Mouse Control**: Custom C# `input-injector.exe` using Win32 SendInput API
+
+## Project Structure
+
+```
+├── src/
+│   ├── app/
+│   │   ├── page.tsx           # Welcome/landing page
+│   │   ├── dashboard/         # QR code generator & pairing dashboard
+│   │   ├── remote/            # Mobile touch controller (trackpad)
+│   │   ├── settings/          # Controller settings
+│   │   └── api/
+│   │       ├── health/        # Health check endpoint
+│   │       └── relay/         # Cloud relay API (message broker)
+│   └── lib/
+│       └── control-protocol.ts # Shared protocol definitions
+├── companion/
+│   └── src/
+│       ├── index.ts           # Companion server (Express + WebSocket)
+│       ├── cloud-relay.ts     # Cloud relay polling client
+│       ├── native-controller.ts # Win32 mouse injection
+│       ├── session-manager.ts # Pairing session management
+│       ├── protocol.ts        # Wire protocol schemas
+│       └── network.ts         # Network interface discovery
+└── vercel.json                # Vercel deployment config
 ```
 
-### Build and Run Companion
-```bash
-npm run companion:build
-npm run companion:start
-```
+## License
 
-### Package Standalone Windows Executable
-```bash
-npm run companion:package-win
-```
-Output: `dist/mobile-as-cursor-companion.exe`
-
----
-
-## Security Model
-
-- Pairing token is cryptographically random and short-lived.
-- Pairing must be approved on the desktop dashboard.
-- Only one mobile device can control the desktop at a time.
-- Commands are schema-validated with Zod.
-- Unauthorized or expired sessions are rejected.
-- Heartbeat timeout auto-disconnects and safely releases mouse button state.
-- Input injection operates strictly between your mobile device and Windows PC.
-
----
-
-## Supported Command Set
-
-- `mouse_move` (relative smooth tracking)
-- `left_click`, `right_click`, `double_click`
-- `scroll` (two-finger scroll, natural scroll toggle)
-- `drag_start`, `drag_end` (drag lock support)
-- `maximize_window`, `restore_window`
-- `zoom_in`, `zoom_out`, `reset_zoom`
-- `heartbeat`, `disconnect`
-
----
-
-## Troubleshooting
-
-- **QR opens page but connection fails**:
-  - Ensure your phone and PC are connected to the same Wi-Fi / LAN network.
-  - Verify Windows Defender Firewall allows inbound traffic on port `4850`.
-  - On the remote screen, click **Host** to verify or manually input your PC's Wi-Fi IP.
-- **Viewing Dashboard on HTTPS (Vercel) shows "Connection Failed"**:
-  - In your PC browser, allow local network access / insecure content for your Vercel domain, or set a secure tunnel for companion (e.g. Cloudflare Tunnel or ngrok).
-  - Alternatively, open the dashboard locally at `http://localhost:3000/dashboard`.
-- **Can’t move cursor**:
-  - Ensure companion is running on your Windows machine.
-  - Ensure you clicked **Approve** on the desktop dashboard.
+MIT
